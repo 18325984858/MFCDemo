@@ -46,14 +46,20 @@ bool CArkUdp::SendCommand(LPCSTR command)
 
     memcpy(packet, NETDRV_UDP_PACKET_MAGIC, NETDRV_UDP_PACKET_MAGIC_LEN);
     memcpy(packet + NETDRV_UDP_PACKET_MAGIC_LEN, command, commandLen);
-    int sent = SendTo(packet, (int)packetLen, NETDRV_UDP_PORT, NETDRV_DRIVER_IP_W);
+
+    if (!m_driverConnected) {
+        if (m_dlg) m_dlg->Log(_T("UDP SendCommand: driver not connected yet"));
+        return false;
+    }
+
+    int sent = SendTo(packet, (int)packetLen, m_driverPort, m_driverIp);
     if (m_dlg) {
         if (sent == SOCKET_ERROR) {
-            m_dlg->Log(_T("UDP SendTo FAILED target=%s:%u command=%S packetLen=%Iu err=%u"),
-                       NETDRV_DRIVER_IP_W, NETDRV_UDP_PORT, command, packetLen, WSAGetLastError());
+            m_dlg->Log(_T("UDP SendTo FAILED target=%s:%u command=%S err=%u"),
+                       (LPCTSTR)m_driverIp, m_driverPort, command, WSAGetLastError());
         } else {
-            m_dlg->Log(_T("UDP SendTo OK target=%s:%u command=%S sent=%d packetLen=%Iu"),
-                       NETDRV_DRIVER_IP_W, NETDRV_UDP_PORT, command, sent, packetLen);
+            m_dlg->Log(_T("UDP SendTo OK target=%s:%u command=%S sent=%d"),
+                       (LPCTSTR)m_driverIp, m_driverPort, command, sent);
         }
     }
     return sent != SOCKET_ERROR;
@@ -118,9 +124,25 @@ void CArkUdp::OnReceive(int nErrorCode)
         }
         const char* payload = buf.data() + NETDRV_UDP_PACKET_MAGIC_LEN;
         int payloadLen = n - NETDRV_UDP_PACKET_MAGIC_LEN;
+
+        /* Detect driver registration / heartbeat (R|hello, R|ping). */
+        if (payloadLen >= 2 && payload[0] == 'R' && payload[1] == '|') {
+            bool wasConnected = m_driverConnected;
+            m_driverIp   = peer;
+            m_driverPort = peerPort;
+            m_driverConnected = true;
+            if (!wasConnected && m_dlg) {
+                m_dlg->Log(_T("Driver connected from %s:%u"), (LPCTSTR)peer, peerPort);
+                CString s;
+                s.Format(_T("Driver connected: %s:%u"), (LPCTSTR)peer, peerPort);
+                m_dlg->GetDlgItem(1005)->SetWindowText(s);  /* IDC_STATUS_TEXT */
+            }
+            continue;  /* R| messages are not forwarded to packet parser */
+        }
+
         if (m_dlg && payloadLen > 0 && payload[0] != 'Y' && payload[0] != 'G') {
             m_dlg->Log(_T("UDP datagram received bytes=%d peer=%s:%u tag=%c"),
-                       n, peer, peerPort, payload[0]);
+                       n, (LPCTSTR)peer, peerPort, payload[0]);
         }
         if (m_dlg) {
             m_dlg->OnArkPacket(payload, payloadLen);

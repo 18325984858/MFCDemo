@@ -183,6 +183,7 @@ static VOID NetDrvControlThread(_In_opt_ PVOID Context)
 {
     PWSK_SOCKET sock = NULL;
     SOCKADDR_IN local;
+    SOCKADDR_IN appAddr;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(Context);
@@ -194,15 +195,20 @@ static VOID NetDrvControlThread(_In_opt_ PVOID Context)
         PsTerminateSystemThread(status);
     }
 
-    NetDrvSetAnySockAddr(&local, NETDRV_UDP_PORT);
+    /* Bind to DRIVER_IP with ephemeral port (driver is the client). */
+    NetDrvSetAnySockAddr(&local, 0);
+    local.sin_addr.S_un.S_un_b.s_b1 = NETDRV_DRIVER_IP_B1;
+    local.sin_addr.S_un.S_un_b.s_b2 = NETDRV_DRIVER_IP_B2;
+    local.sin_addr.S_un.S_un_b.s_b3 = NETDRV_DRIVER_IP_B3;
+    local.sin_addr.S_un.S_un_b.s_b4 = NETDRV_DRIVER_IP_B4;
     status = WSKBind(sock, (PSOCKADDR)&local);
     if (!NT_SUCCESS(status)) {
-        LOG("control bind 0.0.0.0:%u failed 0x%08X", NETDRV_UDP_PORT, status);
+        LOG("control bind %s:0 failed 0x%08X", NETDRV_DRIVER_IP_A, status);
         WSK_closesocket(sock);
         PsTerminateSystemThread(status);
     }
 
-    LOG("control listening 0.0.0.0:%u (driver ip %s)", NETDRV_UDP_PORT, NETDRV_DRIVER_IP_A);
+    LOG("control listening %s:* (driver ip %s)", NETDRV_DRIVER_IP_A, NETDRV_DRIVER_IP_A);
 
     status = NetDrvEnableReceiveEvent(sock);
     if (!NT_SUCCESS(status)) {
@@ -211,15 +217,50 @@ static VOID NetDrvControlThread(_In_opt_ PVOID Context)
         PsTerminateSystemThread(status);
     }
 
+    /* App server address. */
+    RtlZeroMemory(&appAddr, sizeof(appAddr));
+    appAddr.sin_family = AF_INET;
+    appAddr.sin_port   = RtlUshortByteSwap(NETDRV_UDP_PORT);
+    appAddr.sin_addr.S_un.S_un_b.s_b1 = NETDRV_APP_IP_B1;
+    appAddr.sin_addr.S_un.S_un_b.s_b2 = NETDRV_APP_IP_B2;
+    appAddr.sin_addr.S_un.S_un_b.s_b3 = NETDRV_APP_IP_B3;
+    appAddr.sin_addr.S_un.S_un_b.s_b4 = NETDRV_APP_IP_B4;
+
+    /* Send hello to register with app. */
+    {
+        CHAR hello[32];
+        SIZE_T sent = 0;
+        RtlStringCbCopyA(hello, sizeof(hello), NETDRV_UDP_PACKET_MAGIC NETDRV_REG_HELLO);
+        WSKSendTo(sock, hello, strlen(hello), &sent, (PSOCKADDR)&appAddr);
+        LOG("sent R|hello to %s:%u", NETDRV_APP_IP_A, NETDRV_UDP_PORT);
+    }
+
+    LOG("Ready: UDP control %s:* -> app %s:%u",
+        NETDRV_DRIVER_IP_A,
+        NETDRV_APP_IP_A,
+        NETDRV_UDP_PORT);
+
     while (InterlockedCompareExchange(&g_ControlStop, 0, 0) == 0) {
         CHAR command[NETDRV_CMD_SLOT_BYTES];
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -50000000LL;  /* 5 seconds */
 
-        KeWaitForSingleObject(&g_CommandEvent, Executive, KernelMode, FALSE, NULL);
-        if (InterlockedCompareExchange(&g_ControlStop, 0, 0) != 0) {
+        status = KeWaitForSingleObject(&g_CommandEvent, Executive,
+                                        KernelMode, FALSE, &timeout);
+
+        if (InterlockedCompareExchange(&g_ControlStop, 0, 0) != 0)
             break;
+
+        if (status == STATUS_TIMEOUT) {
+            /* Heartbeat: send ping so app knows driver is still alive. */
+            CHAR ping[32];
+            SIZE_T sent = 0;
+            RtlStringCbCopyA(ping, sizeof(ping), NETDRV_UDP_PACKET_MAGIC NETDRV_REG_PING);
+            WSKSendTo(sock, ping, strlen(ping), &sent, (PSOCKADDR)&appAddr);
+            continue;
         }
 
-        // Drain the queue: many P| chunks may have arrived per wake.
+        /* Drain the command queue. */
         while (NetDrvTakeCommand(command, sizeof(command))) {
             NetDrvHandleCommand(command);
         }

@@ -4,9 +4,9 @@
 
 #pragma once
 
-// Network endpoints. Driver sends from NETDRV_DRIVER_IP to NETDRV_APP_IP.
-// User app should be listening on UDP NETDRV_APP_IP:NETDRV_UDP_PORT before
-// sending control commands to the driver.
+// Network endpoints. App is the server (listens on NETDRV_UDP_PORT).
+// Driver is the client: binds an ephemeral port, sends R|hello to app,
+// then receives commands on that port.
 #define NETDRV_DRIVER_IP_A      "192.168.1.179"
 #define NETDRV_DRIVER_IP_W      L"192.168.1.179"
 #define NETDRV_DRIVER_IP_B1     192
@@ -39,6 +39,10 @@
 #define NETDRV_CMD_PUT_END       "C|putend|"   // C|putend|<utf8Path>|<sizeHex>\n
 #define NETDRV_CMD_STOP          "C|stop\n"
 #define NETDRV_CMD_SCREENSHOT    "C|screenshot\n"
+
+// Driver -> App registration / heartbeat (driver-as-client model).
+#define NETDRV_REG_HELLO         "R|hello\n"
+#define NETDRV_REG_PING          "R|ping\n"
 
 // Driver -> local target-side agent command (process enrichment + ping).
 #define NETDRV_AGENT_CMD_PROCESS "A|process\n"

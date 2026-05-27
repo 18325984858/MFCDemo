@@ -1,35 +1,38 @@
-# NetDrv — WSK 网络收发样例驱动
+# NetDrv — WSK Network ARK Driver
 
-参考 [libwsk](https://github.com/microsoft/libwsk-style) 风格写的最小 Winsock Kernel 驱动样例。
+Minimal Winsock Kernel (WSK) driver for remote ARK-style system enumeration and screen capture over UDP.
 
-## 文件
+## Files
 
-| 文件 | 说明 |
+| File | Description |
 | --- | --- |
-| `Driver.c`     | `DriverEntry` / `Unload`，启动一个系统线程做 UDP/TCP 收发测试 |
-| `Wsk.h/.c`     | WSK 封装：`WSKStartup` / `WSK_socket` / `WSKBind` / `WSKConnect` / `WSKSend` / `WSKReceive` / `WSKSendTo` / `WSKReceiveFrom` / `WSK_closesocket` |
-| `NetDrv.inf`   | 安装 INF |
-| `NetDrv.vcxproj` | WDK10 工程（WDM，x64） |
+| `Driver.c`       | `DriverEntry` / `Unload`, starts UDP control listener |
+| `Wsk.h/.c`       | WSK wrappers: `WSKStartup` / `WSK_socket` / `WSKBind` / `WSKSendTo` / `WSK_closesocket` |
+| `NetControl.c/.h`| UDP command dispatcher (receive event callback + worker thread) |
+| `EnumArk.c/.h`   | Process / driver / file enumeration, file upload/download |
+| `ScreenShot.c/.h` | Pure-kernel screen capture via GDI shellcode injection into dwm.exe |
+| `ShellcodeGdi.c`  | PIC shellcode source (compiled separately, bytes embedded in driver) |
+| `Ioctl.h`        | Shared protocol constants (IPs, ports, commands) |
+| `NetDrv.inf`     | Install INF |
+| `NetDrv.vcxproj` | WDK10 project (WDM, x64) |
 
-## 设计要点（与 libwsk 一致）
+## Design
 
-- 全局一份 `WSK_REGISTRATION` + `WSK_PROVIDER_NPI`，`DriverEntry` 注册，`Unload` 释放。
-- 每次 WSK 调用：`IoAllocateIrp` → `IoSetCompletionRoutine`（完成时 `KeSetEvent` 并返回 `STATUS_MORE_PROCESSING_REQUIRED`）→ 调用者 `KeWaitForSingleObject` 等待 → 读 `Irp->IoStatus` → `IoFreeIrp`。
-- 数据缓冲一律用 `IoAllocateMdl` + `MmProbeAndLockPages` 构造 `WSK_BUF`。
-- 所有网络动作都在 `PsCreateSystemThread` 起的系统线程里跑，保证 PASSIVE_LEVEL。
+- Single `WSK_REGISTRATION` + `WSK_PROVIDER_NPI`; registered in `DriverEntry`, released in `Unload`.
+- Each WSK call: `IoAllocateIrp` + `IoSetCompletionRoutine` (signals `KEVENT`, returns `STATUS_MORE_PROCESSING_REQUIRED`) + caller `KeWaitForSingleObject` + read `Irp->IoStatus` + `IoFreeIrp`.
+- Data buffers use `IoAllocateMdl` + `MmProbeAndLockPages` to build `WSK_BUF`.
+- All network operations run in a system thread (`PsCreateSystemThread`) at PASSIVE_LEVEL.
 
-## 自检行为（加载即触发）
+## Protocol
 
-1. UDP：向 `127.0.0.1:9999` 发一个 `"hello from NetDrv (UDP)"`。
-2. TCP：连 `127.0.0.1:80`，发 `GET /` 并打印最多 256 字节回包。
+Driver listens on `NETDRV_DRIVER_IP:9999`, streams results to `NETDRV_APP_IP:9999`.
+All datagrams start with `NDARK1|` magic. Commands: `C|process`, `C|driver`, `C|file|<path>`, `C|get|<path>`, `C|put|...`, `C|screenshot`, `C|stop`.
 
-用 DbgView / WinDbg 看 `[NetDrv]` 前缀的输出。
+## Build
 
-## 构建
+Open `NetDrv.vcxproj` with Visual Studio + WDK10, select `x64 Release`, Build. Produces `NetDrv.sys` / `NetDrv.inf`.
 
-用 Visual Studio + WDK10 打开 `NetDrv.vcxproj`，选 `x64`，Build。生成 `NetDrv.sys` / `NetDrv.inf`。
-
-## 安装 / 卸载（测试机需开 testsigning）
+## Install / Uninstall (test machine with testsigning enabled)
 
 ```
 sc create NetDrv type= kernel binPath= C:\path\to\NetDrv.sys
