@@ -17,4 +17,18 @@ Release/
 .vs/
 *.exe
 *.sys
+*.dll
 *_gen.h
+
+# Qt build artifacts
+QtApp/build/
+deploy/
+
+# Qt runtime deployed to root
+platforms/
+styles/
+imageformats/
+tls/
+generic/
+iconengines/
+networkinformation/

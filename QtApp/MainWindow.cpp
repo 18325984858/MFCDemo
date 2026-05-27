@@ -11,6 +11,15 @@
 #include <QPixmap>
 #include <QDebug>
 #include <QApplication>
+#include <QThread>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <wintrust.h>
+#include <softpub.h>
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "version.lib")
+#endif
 
 // ---- helpers ----
 
@@ -23,6 +32,95 @@ QString MainWindow::hexToUtf8(const QByteArray& hex)
 {
     QByteArray raw = QByteArray::fromHex(hex);
     return QString::fromUtf8(raw);
+}
+
+void MainWindow::buildDriveMap()
+{
+#ifdef Q_OS_WIN
+    m_driveMap.clear();
+    WCHAR drives[256] = {};
+    DWORD n = GetLogicalDriveStringsW(255, drives);
+    for (LPWSTR d = drives; *d; d += wcslen(d) + 1) {
+        WCHAR letter[3] = { d[0], L':', 0 };
+        WCHAR target[MAX_PATH] = {};
+        if (QueryDosDeviceW(letter, target, MAX_PATH)) {
+            m_driveMap.append({QString::fromWCharArray(target),
+                              QString::fromWCharArray(letter)});
+        }
+    }
+#endif
+}
+
+QString MainWindow::ntPathToDos(const QString& nt) const
+{
+    if (nt.isEmpty() || nt == "-") return nt;
+    if (nt.startsWith("\\SystemRoot\\", Qt::CaseInsensitive)) {
+#ifdef Q_OS_WIN
+        WCHAR winDir[MAX_PATH];
+        GetWindowsDirectoryW(winDir, MAX_PATH);
+        return QString::fromWCharArray(winDir) + "\\" + nt.mid(12);
+#endif
+    }
+    if (nt.startsWith("\\??\\" )) return nt.mid(4);
+    for (const auto& kv : m_driveMap) {
+        if (nt.length() > kv.first.length() &&
+            nt.startsWith(kv.first, Qt::CaseInsensitive) &&
+            nt[kv.first.length()] == '\\') {
+            return kv.second + nt.mid(kv.first.length());
+        }
+    }
+    return nt;
+}
+
+QString MainWindow::queryFileVendor(const QString& dosPath)
+{
+#ifdef Q_OS_WIN
+    std::wstring ws = dosPath.toStdWString();
+    DWORD dummy = 0;
+    DWORD sz = GetFileVersionInfoSizeW(ws.c_str(), &dummy);
+    if (sz == 0) return "-";
+    QByteArray buf(sz, 0);
+    if (!GetFileVersionInfoW(ws.c_str(), 0, sz, buf.data())) return "-";
+    struct { WORD lang; WORD cp; } *trans = nullptr;
+    UINT transLen = 0;
+    VerQueryValueW(buf.data(), L"\\VarFileInfo\\Translation", (void**)&trans, &transLen);
+    if (!trans || transLen < sizeof(*trans)) return "-";
+    wchar_t subBlock[128];
+    wsprintfW(subBlock, L"\\StringFileInfo\\%04x%04x\\CompanyName", trans->lang, trans->cp);
+    wchar_t* val = nullptr;
+    UINT valLen = 0;
+    if (VerQueryValueW(buf.data(), subBlock, (void**)&val, &valLen) && val && valLen > 0)
+        return QString::fromWCharArray(val, valLen - 1);
+#else
+    Q_UNUSED(dosPath);
+#endif
+    return "-";
+}
+
+QString MainWindow::queryFileSign(const QString& dosPath)
+{
+#ifdef Q_OS_WIN
+    std::wstring ws = dosPath.toStdWString();
+    WINTRUST_FILE_INFO fi = {};
+    fi.cbStruct = sizeof(fi);
+    fi.pcwszFilePath = ws.c_str();
+    GUID policyGuid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA wd = {};
+    wd.cbStruct = sizeof(wd);
+    wd.dwUIChoice = WTD_UI_NONE;
+    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+    wd.dwUnionChoice = WTD_CHOICE_FILE;
+    wd.pFile = &fi;
+    wd.dwStateAction = WTD_STATEACTION_VERIFY;
+    wd.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
+    LONG r = WinVerifyTrust(NULL, &policyGuid, &wd);
+    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(NULL, &policyGuid, &wd);
+    return (r == ERROR_SUCCESS) ? "Signed" : "Unsigned";
+#else
+    Q_UNUSED(dosPath);
+    return "-";
+#endif
 }
 
 // ---- constructor ----
@@ -98,6 +196,14 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
     m_shotLabel->setMinimumSize(320, 200);
     m_tabs->addTab(m_shotLabel, "Screenshot");
 
+    // Progress bar — below tabs, above status bar, visible from any tab
+    m_progressBar = new QProgressBar;
+    m_progressBar->setTextVisible(true);
+    m_progressBar->setAlignment(Qt::AlignCenter);
+    m_progressBar->setFixedHeight(22);
+    m_progressBar->hide();
+    vbox->addWidget(m_progressBar);
+
     // status bar
     statusBar()->showMessage("Waiting for driver connection...");
 
@@ -121,6 +227,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
     connect(m_udp, &UdpLink::packetReceived,
             this, &MainWindow::onPacket);
     m_udp->start("0.0.0.0", NETDRV_UDP_PORT);
+
+    buildDriveMap();
+    initFileTree();
 }
 
 void MainWindow::setStatus(const QString& msg)
@@ -242,37 +351,56 @@ void MainWindow::handleLine(const QByteArray& line)
 
     if (tag == 'P') {
         // P|pid|ppid|session|eprocess|createTime|name|path
-        auto parts = rest.split('|');
-        if (parts.size() < 7) return;
+        // path may contain '|', so limit split to 7 fields
+        int fieldCount = 0;
+        int splits[7];
+        for (int i = 0; i < rest.size() && fieldCount < 6; ++i) {
+            if (rest[i] == '|') splits[fieldCount++] = i;
+        }
+        if (fieldCount < 6) return;
+        QByteArray f0 = rest.left(splits[0]);
+        QByteArray f1 = rest.mid(splits[0]+1, splits[1]-splits[0]-1);
+        QByteArray f2 = rest.mid(splits[1]+1, splits[2]-splits[1]-1);
+        QByteArray f3 = rest.mid(splits[2]+1, splits[3]-splits[2]-1);
+        QByteArray f4 = rest.mid(splits[3]+1, splits[4]-splits[3]-1);
+        QByteArray f5 = rest.mid(splits[4]+1, splits[5]-splits[4]-1);
+        QByteArray f6 = rest.mid(splits[5]+1); // path = remainder
+
         int row = m_procTable->rowCount();
         m_procTable->insertRow(row);
-        QString name = QString::fromUtf8(parts[5]);
-        QString path = QString::fromUtf8(parts[6]);
-        uint pid = parts[0].toUInt();
+        QString name = QString::fromUtf8(f5);
+        QString ntPath = QString::fromUtf8(f6).trimmed();
+        QString dosPath = ntPathToDos(ntPath);
+        uint pid = f0.toUInt();
 
         // createTime: 100ns since 1601 -> QDateTime
-        qint64 ft = parts[4].toLongLong();
+        qint64 ft = f4.toLongLong();
         QString ctime = "-";
         if (ft > 0) {
-            // FILETIME epoch is 1601-01-01; Qt epoch is 1970-01-01.
-            // Diff = 116444736000000000 * 100ns
             qint64 unixUs = (ft - 116444736000000000LL) / 10;
             QDateTime dt = QDateTime::fromMSecsSinceEpoch(unixUs / 1000, Qt::LocalTime);
             ctime = dt.toString("yyyy/MM/dd HH:mm:ss");
+        }
+
+        // Local enrichment: sign + vendor
+        QString sign = "-", vendor = "-";
+        if (!dosPath.isEmpty() && dosPath != "-") {
+            sign   = queryFileSign(dosPath);
+            vendor = queryFileVendor(dosPath);
         }
 
         auto set = [&](int col, const QString& val) {
             m_procTable->setItem(row, col, new QTableWidgetItem(val));
         };
         set(0, name);
-        set(1, QString::fromLatin1(parts[0]));
-        set(2, QString::fromLatin1(parts[1]));
-        set(3, QString::fromLatin1(parts[2]));
+        set(1, QString::fromLatin1(f0));
+        set(2, QString::fromLatin1(f1));
+        set(3, QString::fromLatin1(f2));
         set(4, "-");  // user (filled by U|)
-        set(5, path);
-        set(6, QString::fromLatin1(parts[3]));
-        set(7, "-");  // sign
-        set(8, "-");  // vendor
+        set(5, dosPath);
+        set(6, QString::fromLatin1(f3));
+        set(7, sign);
+        set(8, vendor);
         set(9, ctime);
         set(10, "-"); // cmdline (filled by U|)
 
@@ -284,19 +412,41 @@ void MainWindow::handleLine(const QByteArray& line)
 
     if (tag == 'D') {
         // D|name|base|size|order|drvObj|objName|svc|path
-        auto parts = rest.split('|');
-        if (parts.size() < 8) return;
+        // path is last field and may contain '|', so limit split
+        int fc = 0;
+        int sp[8];
+        for (int i = 0; i < rest.size() && fc < 7; ++i) {
+            if (rest[i] == '|') sp[fc++] = i;
+        }
+        if (fc < 7) return;
+        QString dName   = QString::fromUtf8(rest.left(sp[0]));
+        QString dBase   = QString::fromLatin1(rest.mid(sp[0]+1, sp[1]-sp[0]-1));
+        QString dSize   = QString::fromLatin1(rest.mid(sp[1]+1, sp[2]-sp[1]-1));
+        QString dOrder  = QString::fromLatin1(rest.mid(sp[2]+1, sp[3]-sp[2]-1));
+        QString dObj    = QString::fromLatin1(rest.mid(sp[3]+1, sp[4]-sp[3]-1));
+        QString dObjNm  = QString::fromUtf8(rest.mid(sp[4]+1, sp[5]-sp[4]-1));
+        QString dSvc    = QString::fromUtf8(rest.mid(sp[5]+1, sp[6]-sp[5]-1));
+        QString dPath   = ntPathToDos(QString::fromUtf8(rest.mid(sp[6]+1)));
+
+        QString sign = "-", company = "-";
+        if (!dPath.isEmpty() && dPath != "-") {
+            sign    = queryFileSign(dPath);
+            company = queryFileVendor(dPath);
+        }
+
         int row = m_drvTable->rowCount();
         m_drvTable->insertRow(row);
-        for (int i = 0; i < 8 && i < 10; ++i) {
-            QString val = (i < parts.size()) ? QString::fromUtf8(parts[i]) : "-";
-            m_drvTable->setItem(row, i, new QTableWidgetItem(val));
-        }
-        // sign + company columns left empty for now
-        if (m_drvTable->item(row, 8) == nullptr)
-            m_drvTable->setItem(row, 8, new QTableWidgetItem("-"));
-        if (m_drvTable->item(row, 9) == nullptr)
-            m_drvTable->setItem(row, 9, new QTableWidgetItem("-"));
+        // Columns: Driver|Base|Size|Order|DrvObj|ObjName|Service|Sign|Company|Path
+        m_drvTable->setItem(row, 0, new QTableWidgetItem(dName));
+        m_drvTable->setItem(row, 1, new QTableWidgetItem(dBase));
+        m_drvTable->setItem(row, 2, new QTableWidgetItem(dSize));
+        m_drvTable->setItem(row, 3, new QTableWidgetItem(dOrder));
+        m_drvTable->setItem(row, 4, new QTableWidgetItem(dObj));
+        m_drvTable->setItem(row, 5, new QTableWidgetItem(dObjNm));
+        m_drvTable->setItem(row, 6, new QTableWidgetItem(dSvc));
+        m_drvTable->setItem(row, 7, new QTableWidgetItem(sign));
+        m_drvTable->setItem(row, 8, new QTableWidgetItem(company));
+        m_drvTable->setItem(row, 9, new QTableWidgetItem(dPath));
         return;
     }
 }
@@ -328,6 +478,12 @@ void MainWindow::onRefresh()
             while (sel.first()->childCount())
                 delete sel.first()->takeChild(0);
             requestFileEnum(path);
+        } else {
+            m_fileTree->clear();
+            m_treeIndex.clear();
+            m_fileEntries.clear();
+            m_fileLoaded.clear();
+            initFileTree();
         }
     } else if (tab == 3) {
         m_shotReceiving = false;
@@ -439,6 +595,24 @@ void MainWindow::renderShot()
 }
 
 // ---- file browser ----
+
+void MainWindow::initFileTree()
+{
+#ifdef Q_OS_WIN
+    WCHAR drives[256] = {};
+    DWORD n = GetLogicalDriveStringsW(255, drives);
+    for (LPWSTR d = drives; *d; d += wcslen(d) + 1) {
+        QString driveText = QString::fromWCharArray(d); // "C:\"
+        auto* item = new QTreeWidgetItem(m_fileTree, {driveText});
+        item->setChildIndicatorPolicy(QTreeWidgetItem::ShowIndicator);
+        m_treeIndex[driveText] = item;
+    }
+#else
+    auto* root = new QTreeWidgetItem(m_fileTree, {"/"});
+    root->setChildIndicatorPolicy(QTreeWidgetItem::ShowIndicator);
+    m_treeIndex["/"] = root;
+#endif
+}
 
 void MainWindow::requestFileEnum(const QString& path)
 {
@@ -575,6 +749,12 @@ void MainWindow::onDownload()
     m_dlTotal = 0;
     m_dlRetries = 0;
 
+    // Show download progress
+    m_progressBar->setRange(0, 100);
+    m_progressBar->setValue(0);
+    m_progressBar->setFormat(QString("Download: %1  0%%").arg(name));
+    m_progressBar->show();
+
     QByteArray cmd = QByteArray(NETDRV_CMD_GET_FILE) + remotePath.toUtf8() + "\n";
     m_udp->sendCommand(cmd);
     setStatus(QString("[get] requested %1").arg(remotePath));
@@ -601,6 +781,12 @@ void MainWindow::appendDownloadChunk(quint64 off, const QByteArray& data)
     m_dlFile->seek(off);
     m_dlFile->write(data);
     m_dlReceived += data.size();
+    if (m_dlTotal > 0 && m_progressBar->isVisible()) {
+        int pct = (int)(m_dlReceived * 100 / m_dlTotal);
+        m_progressBar->setValue(pct);
+        m_progressBar->setFormat(QString("Download: %1%%  %2/%3")
+            .arg(pct).arg(m_dlReceived).arg(m_dlTotal));
+    }
 }
 
 void MainWindow::endDownload(quint64 reported)
@@ -627,6 +813,7 @@ void MainWindow::endDownload(quint64 reported)
         setStatus(QString("[get] INCOMPLETE %1/%2 -> %3")
                   .arg(m_dlReceived).arg(reported).arg(m_dlLocalPath));
     m_dlRetries = 0;
+    m_progressBar->hide();
 }
 
 // ---- upload ----
@@ -661,6 +848,12 @@ void MainWindow::onUpload()
         + "|" + QByteArray::number(chunkCount) + "\n";
     m_udp->sendCommand(putCmd);
 
+    // Show upload progress
+    m_progressBar->setRange(0, 100);
+    m_progressBar->setValue(0);
+    m_progressBar->setFormat(QString("Upload: %1  0%%").arg(fileName));
+    m_progressBar->show();
+
     static const char kHex[] = "0123456789ABCDEF";
     quint64 sent = 0;
     uint idx = 0;
@@ -686,6 +879,10 @@ void MainWindow::onUpload()
         sent += chunk.size();
         ++idx;
         if ((idx & 0xF) == 0) {
+            int pct = (int)(sent * 100 / total);
+            m_progressBar->setValue(pct);
+            m_progressBar->setFormat(QString("Upload: %1%%  %2/%3")
+                .arg(pct).arg(sent).arg(total));
             setStatus(QString("[put] %1 / %2").arg(sent).arg(total));
             QApplication::processEvents();
             QThread::msleep(2);
@@ -696,6 +893,10 @@ void MainWindow::onUpload()
     QByteArray endCmd = QByteArray(NETDRV_CMD_PUT_END) + remotePath.toUtf8()
         + "|" + QByteArray::number(total, 16).toUpper() + "\n";
     m_udp->sendCommand(endCmd);
+    m_progressBar->setValue(100);
+    m_progressBar->setFormat("Upload: 100%% Complete");
+    QThread::msleep(500);
+    m_progressBar->hide();
     setStatus(QString("[put] sent %1 bytes (%2 chunks) -> %3")
               .arg(sent).arg(idx).arg(remotePath));
 }

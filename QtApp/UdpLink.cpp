@@ -1,5 +1,6 @@
 #include "UdpLink.h"
 #include "Ioctl.h"
+#include <QVariant>
 #include <QDebug>
 
 UdpLink::UdpLink(QObject* parent) : QObject(parent) {}

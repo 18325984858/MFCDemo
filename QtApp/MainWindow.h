@@ -5,6 +5,7 @@
 #include <QTreeWidget>
 #include <QLabel>
 #include <QPushButton>
+#include <QProgressBar>
 #include <QStatusBar>
 #include <QTimer>
 #include <QFile>
@@ -38,6 +39,7 @@ private:
     void renderShot();
 
     // file browser
+    void initFileTree();
     void requestFileEnum(const QString& path);
     void beginFileBatch(const QString& path);
     void appendFileEntry(bool isDir, quint64 size, const QString& name);
@@ -54,6 +56,10 @@ private:
     static QByteArray hexDecode(const QByteArray& hex);
     static QString hexToUtf8(const QByteArray& hex);
     int currentTab() const { return m_tabs->currentIndex(); }
+    QString ntPathToDos(const QString& nt) const;
+    void buildDriveMap();
+    static QString queryFileVendor(const QString& dosPath);
+    static QString queryFileSign(const QString& dosPath);
 
     // UI
     QTabWidget*    m_tabs;
@@ -65,6 +71,7 @@ private:
     QPushButton*   m_btnRefresh;
     QPushButton*   m_btnDownload;
     QPushButton*   m_btnUpload;
+    QProgressBar*  m_progressBar;
 
     // networking
     UdpLink*       m_udp;
@@ -100,4 +107,7 @@ private:
 
     // process rows
     QMap<uint, int> m_processRows;
+
+    // drive letter map: NT path prefix -> drive letter
+    QVector<QPair<QString,QString>> m_driveMap;
 };
