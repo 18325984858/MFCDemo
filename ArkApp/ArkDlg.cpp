@@ -6,6 +6,67 @@
 
 #include <cstdarg>
 
+/* ---- Compile-time language selection ----
+   Define LANG_CN in preprocessor to build Chinese version.
+   Default is English.                                       */
+#ifdef LANG_CN
+#define S_TAB_PROCESS     _T("\x8FDB\x7A0B")
+#define S_TAB_DRIVER      _T("\x9A71\x52A8\x6A21\x5757")
+#define S_TAB_FILE        _T("\x6587\x4EF6")
+#define S_TAB_SCREENSHOT  _T("\x622A\x56FE")
+#define S_COL_IMAGE       _T("\x6620\x50CF\x540D\x79F0")
+#define S_COL_PID         _T("\x8FDB\x7A0BID")
+#define S_COL_PPID        _T("\x7236\x8FDB\x7A0BID")
+#define S_COL_SESSION     _T("\x4F1A\x8BDDID")
+#define S_COL_USER        _T("\x7528\x6237\x540D")
+#define S_COL_PATH        _T("\x6620\x50CF\x8DEF\x5F84")
+#define S_COL_SIGN        _T("\x7B7E\x540D")
+#define S_COL_VENDOR      _T("\x6587\x4EF6\x5382\x5546")
+#define S_COL_CREATED     _T("\x521B\x5EFA\x65F6\x95F4")
+#define S_COL_CMDLINE     _T("\x542F\x52A8\x53C2\x6570")
+#define S_COL_DRVNAME     _T("\x9A71\x52A8\x540D")
+#define S_COL_BASE        _T("\x57FA\x5730\x5740")
+#define S_COL_SIZE        _T("\x5927\x5C0F")
+#define S_COL_ORDER       _T("\x52A0\x8F7D\x987A\x5E8F")
+#define S_COL_DRVOBJ      _T("\x9A71\x52A8\x5BF9\x8C61")
+#define S_COL_OBJNAME     _T("\x5BF9\x8C61\x540D\x79F0")
+#define S_COL_SERVICE     _T("\x670D\x52A1\x540D\x79F0")
+#define S_COL_DIGSIGN     _T("\x6570\x5B57\x7B7E\x540D")
+#define S_COL_COMPANY     _T("\x516C\x53F8\x540D")
+#define S_COL_FPATH       _T("\x8DEF\x5F84")
+#define S_COL_NAME        _T("\x540D\x79F0")
+#define S_COL_FSIZE       _T("\x5927\x5C0F")
+#define S_COL_TYPE        _T("\x7C7B\x578B")
+#else
+#define S_TAB_PROCESS     _T("Process")
+#define S_TAB_DRIVER      _T("Driver")
+#define S_TAB_FILE        _T("File")
+#define S_TAB_SCREENSHOT  _T("Screenshot")
+#define S_COL_IMAGE       _T("Image")
+#define S_COL_PID         _T("PID")
+#define S_COL_PPID        _T("PPID")
+#define S_COL_SESSION     _T("Session")
+#define S_COL_USER        _T("User")
+#define S_COL_PATH        _T("Path")
+#define S_COL_SIGN        _T("Sign")
+#define S_COL_VENDOR      _T("Vendor")
+#define S_COL_CREATED     _T("Created")
+#define S_COL_CMDLINE     _T("CmdLine")
+#define S_COL_DRVNAME     _T("Driver")
+#define S_COL_BASE        _T("Base")
+#define S_COL_SIZE        _T("Size")
+#define S_COL_ORDER       _T("Order")
+#define S_COL_DRVOBJ      _T("DrvObj")
+#define S_COL_OBJNAME     _T("ObjName")
+#define S_COL_SERVICE     _T("Service")
+#define S_COL_DIGSIGN     _T("Sign")
+#define S_COL_COMPANY     _T("Company")
+#define S_COL_FPATH       _T("Path")
+#define S_COL_NAME        _T("Name")
+#define S_COL_FSIZE       _T("Size")
+#define S_COL_TYPE        _T("Type")
+#endif
+
 static std::vector<CStringA> SplitA(const CStringA& text, char delimiter)
 {
     std::vector<CStringA> fields;
@@ -92,7 +153,6 @@ BEGIN_MESSAGE_MAP(CArkDlg, CDialogEx)
     ON_BN_CLICKED(IDC_BTN_REFRESH,  &CArkDlg::OnBnClickedRefresh)
     ON_BN_CLICKED(IDC_BTN_DOWNLOAD, &CArkDlg::OnBnClickedDownload)
     ON_BN_CLICKED(IDC_BTN_UPLOAD,   &CArkDlg::OnBnClickedUpload)
-    ON_BN_CLICKED(IDC_BTN_LANG,     &CArkDlg::OnBnClickedLang)
     ON_NOTIFY(TCN_SELCHANGE, IDC_TAB, &CArkDlg::OnTabSelChange)
     ON_NOTIFY(TVN_ITEMEXPANDING, IDC_FILE_TREE, &CArkDlg::OnTreeItemExpanding)
     ON_NOTIFY(TVN_SELCHANGED,    IDC_FILE_TREE, &CArkDlg::OnTreeSelChanged)
@@ -112,45 +172,45 @@ BOOL CArkDlg::OnInitDialog()
     BuildDriveLetterMap();
 
     // Tabs
-    m_tab.InsertItem(0, _T("进程"));
-    m_tab.InsertItem(1, _T("驱动模块"));
-    m_tab.InsertItem(2, _T("文件"));
-    m_tab.InsertItem(3, _T("截图"));
+    m_tab.InsertItem(0, S_TAB_PROCESS);
+    m_tab.InsertItem(1, S_TAB_DRIVER);
+    m_tab.InsertItem(2, S_TAB_FILE);
+    m_tab.InsertItem(3, S_TAB_SCREENSHOT);
     m_tab.SetCurSel(0);
 
     // Two list-view tables.
     m_listProc.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
     int c = 0;
-    m_listProc.InsertColumn(c++, _T("映像名称"), LVCFMT_LEFT,  140);
-    m_listProc.InsertColumn(c++, _T("进程ID"),  LVCFMT_RIGHT,  60);
-    m_listProc.InsertColumn(c++, _T("父进程ID"), LVCFMT_RIGHT,  60);
-    m_listProc.InsertColumn(c++, _T("会话ID"),  LVCFMT_RIGHT,  50);
-    m_listProc.InsertColumn(c++, _T("用户名"),  LVCFMT_LEFT,  130);
-    m_listProc.InsertColumn(c++, _T("映像路径"), LVCFMT_LEFT,  260);
+    m_listProc.InsertColumn(c++, S_COL_IMAGE,   LVCFMT_LEFT,  140);
+    m_listProc.InsertColumn(c++, S_COL_PID,     LVCFMT_RIGHT,  60);
+    m_listProc.InsertColumn(c++, S_COL_PPID,    LVCFMT_RIGHT,  60);
+    m_listProc.InsertColumn(c++, S_COL_SESSION, LVCFMT_RIGHT,  50);
+    m_listProc.InsertColumn(c++, S_COL_USER,    LVCFMT_LEFT,  130);
+    m_listProc.InsertColumn(c++, S_COL_PATH,    LVCFMT_LEFT,  260);
     m_listProc.InsertColumn(c++, _T("EPROCESS"), LVCFMT_LEFT, 130);
-    m_listProc.InsertColumn(c++, _T("签名"),    LVCFMT_LEFT,   60);
-    m_listProc.InsertColumn(c++, _T("文件厂商"), LVCFMT_LEFT,  150);
-    m_listProc.InsertColumn(c++, _T("创建时间"), LVCFMT_LEFT,  140);
-    m_listProc.InsertColumn(c++, _T("启动参数"), LVCFMT_LEFT,  300);
+    m_listProc.InsertColumn(c++, S_COL_SIGN,    LVCFMT_LEFT,   60);
+    m_listProc.InsertColumn(c++, S_COL_VENDOR,  LVCFMT_LEFT,  150);
+    m_listProc.InsertColumn(c++, S_COL_CREATED, LVCFMT_LEFT,  140);
+    m_listProc.InsertColumn(c++, S_COL_CMDLINE, LVCFMT_LEFT,  300);
 
     m_listDrv.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
     int dc = 0;
-    m_listDrv.InsertColumn(dc++, _T("驱动名"),    LVCFMT_LEFT,  140);
-    m_listDrv.InsertColumn(dc++, _T("基地址"),    LVCFMT_LEFT,  120);
-    m_listDrv.InsertColumn(dc++, _T("大小"),      LVCFMT_RIGHT,  90);
-    m_listDrv.InsertColumn(dc++, _T("加载顺序"),  LVCFMT_RIGHT,  60);
-    m_listDrv.InsertColumn(dc++, _T("驱动对象"),  LVCFMT_LEFT,  120);
-    m_listDrv.InsertColumn(dc++, _T("对象名称"),  LVCFMT_LEFT,  150);
-    m_listDrv.InsertColumn(dc++, _T("服务名称"),  LVCFMT_LEFT,  120);
-    m_listDrv.InsertColumn(dc++, _T("数字签名"),  LVCFMT_LEFT,   70);
-    m_listDrv.InsertColumn(dc++, _T("公司名"),    LVCFMT_LEFT,  150);
-    m_listDrv.InsertColumn(dc++, _T("路径"),      LVCFMT_LEFT,  340);
+    m_listDrv.InsertColumn(dc++, S_COL_DRVNAME, LVCFMT_LEFT,  140);
+    m_listDrv.InsertColumn(dc++, S_COL_BASE,    LVCFMT_LEFT,  120);
+    m_listDrv.InsertColumn(dc++, S_COL_SIZE,    LVCFMT_RIGHT,  90);
+    m_listDrv.InsertColumn(dc++, S_COL_ORDER,   LVCFMT_RIGHT,  60);
+    m_listDrv.InsertColumn(dc++, S_COL_DRVOBJ,  LVCFMT_LEFT,  120);
+    m_listDrv.InsertColumn(dc++, S_COL_OBJNAME, LVCFMT_LEFT,  150);
+    m_listDrv.InsertColumn(dc++, S_COL_SERVICE, LVCFMT_LEFT,  120);
+    m_listDrv.InsertColumn(dc++, S_COL_DIGSIGN, LVCFMT_LEFT,   70);
+    m_listDrv.InsertColumn(dc++, S_COL_COMPANY, LVCFMT_LEFT,  150);
+    m_listDrv.InsertColumn(dc++, S_COL_FPATH,   LVCFMT_LEFT,  340);
 
     // File list columns (name / size / type).
     m_fileList.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-    m_fileList.InsertColumn(0, _T("名称"),    LVCFMT_LEFT,  360);
-    m_fileList.InsertColumn(1, _T("大小"),    LVCFMT_RIGHT, 140);
-    m_fileList.InsertColumn(2, _T("类型"),    LVCFMT_LEFT,   80);
+    m_fileList.InsertColumn(0, S_COL_NAME,  LVCFMT_LEFT,  360);
+    m_fileList.InsertColumn(1, S_COL_FSIZE, LVCFMT_RIGHT, 140);
+    m_fileList.InsertColumn(2, S_COL_TYPE,  LVCFMT_LEFT,   80);
     InitFileTab();
 
     CString s;
@@ -213,75 +273,6 @@ void CArkDlg::SendDriverCommand(LPCSTR command, LPCTSTR label)
     m_status.SetWindowText(s);
     Log(_T("TX command FAILED label=%s payload=%S err=%u"),
         label, command ? command : "(null)", WSAGetLastError());
-}
-
-void CArkDlg::OnBnClickedLang()
-{
-    m_isEnglish = !m_isEnglish;
-    ApplyLanguage();
-}
-
-static void SetColumnText(CListCtrl& lc, int col, LPCTSTR text)
-{
-    LVCOLUMN lvc = {};
-    lvc.mask = LVCF_TEXT;
-    lvc.pszText = (LPTSTR)text;
-    lc.SetColumn(col, &lvc);
-}
-
-void CArkDlg::ApplyLanguage()
-{
-    bool en = m_isEnglish;
-    GetDlgItem(IDC_BTN_LANG)->SetWindowText(en ? _T("CN") : _T("EN"));
-    GetDlgItem(IDC_BTN_DOWNLOAD)->SetWindowText(en ? _T("Download") : _T("\x4E0B\x8F7D"));
-    GetDlgItem(IDC_BTN_UPLOAD)->SetWindowText(en ? _T("Upload") : _T("\x4E0A\x4F20"));
-
-    /* Tabs */
-    TCITEM ti = {}; ti.mask = TCIF_TEXT;
-    LPCTSTR tabs_cn[] = { _T("\x8FDB\x7A0B"), _T("\x9A71\x52A8\x6A21\x5757"), _T("\x6587\x4EF6"), _T("\x622A\x56FE") };
-    LPCTSTR tabs_en[] = { _T("Process"), _T("Driver"), _T("File"), _T("Screenshot") };
-    for (int i = 0; i < 4; i++) {
-        ti.pszText = (LPTSTR)(en ? tabs_en[i] : tabs_cn[i]);
-        m_tab.SetItem(i, &ti);
-    }
-
-    /* Process list columns */
-    LPCTSTR pc_cn[] = { _T("\x6620\x50CF\x540D\x79F0"), _T("\x8FDB\x7A0BID"), _T("\x7236\x8FDB\x7A0BID"),
-        _T("\x4F1A\x8BDDID"), _T("\x7528\x6237\x540D"), _T("\x6620\x50CF\x8DEF\x5F84"),
-        _T("EPROCESS"), _T("\x7B7E\x540D"), _T("\x6587\x4EF6\x5382\x5546"),
-        _T("\x521B\x5EFA\x65F6\x95F4"), _T("\x542F\x52A8\x53C2\x6570") };
-    LPCTSTR pc_en[] = { _T("Image"), _T("PID"), _T("PPID"), _T("Session"),
-        _T("User"), _T("Path"), _T("EPROCESS"), _T("Sign"),
-        _T("Vendor"), _T("Created"), _T("CmdLine") };
-    for (int i = 0; i < 11; i++)
-        SetColumnText(m_listProc, i, en ? pc_en[i] : pc_cn[i]);
-
-    /* Driver list columns */
-    LPCTSTR dc_cn[] = { _T("\x9A71\x52A8\x540D"), _T("\x57FA\x5730\x5740"), _T("\x5927\x5C0F"),
-        _T("\x52A0\x8F7D\x987A\x5E8F"), _T("\x9A71\x52A8\x5BF9\x8C61"), _T("\x5BF9\x8C61\x540D\x79F0"),
-        _T("\x670D\x52A1\x540D\x79F0"), _T("\x6570\x5B57\x7B7E\x540D"), _T("\x516C\x53F8\x540D"),
-        _T("\x8DEF\x5F84") };
-    LPCTSTR dc_en[] = { _T("Driver"), _T("Base"), _T("Size"), _T("Order"),
-        _T("DrvObj"), _T("ObjName"), _T("Service"), _T("Sign"),
-        _T("Company"), _T("Path") };
-    for (int i = 0; i < 10; i++)
-        SetColumnText(m_listDrv, i, en ? dc_en[i] : dc_cn[i]);
-
-    /* File list columns */
-    LPCTSTR fc_cn[] = { _T("\x540D\x79F0"), _T("\x5927\x5C0F"), _T("\x7C7B\x578B") };
-    LPCTSTR fc_en[] = { _T("Name"), _T("Size"), _T("Type") };
-    for (int i = 0; i < 3; i++)
-        SetColumnText(m_fileList, i, en ? fc_en[i] : fc_cn[i]);
-
-    m_tab.Invalidate();
-    m_listProc.Invalidate();
-    m_listDrv.Invalidate();
-    m_fileList.Invalidate();
-
-    /* Re-layout buttons (English labels are wider) */
-    CRect rc;
-    GetClientRect(&rc);
-    SendMessage(WM_SIZE, SIZE_RESTORED, MAKELPARAM(rc.Width(), rc.Height()));
 }
 
 void CArkDlg::OnBnClickedRefresh()
@@ -401,14 +392,13 @@ void CArkDlg::OnSize(UINT nType, int cx, int cy)
     const int btnW     = 70;
     const int btnH     = 22;
     const int tabH     = 22;
-    const int dlW      = m_isEnglish ? 76 : 60;
-    const int ulW      = m_isEnglish ? 64 : 60;
-    const int lnW      = 40;
+    const int dlW      = 76;
+    const int ulW      = 64;
 
     // Tab strip
     m_tab.SetWindowPos(NULL,
         margin, margin,
-        cx - margin * 2 - btnW - margin - dlW - margin - ulW - margin - lnW - margin, tabH,
+        cx - margin * 2 - btnW - margin - dlW - margin - ulW - margin, tabH,
         SWP_NOZORDER);
 
     // Refresh button
@@ -423,10 +413,6 @@ void CArkDlg::OnSize(UINT nType, int cx, int cy)
     rx -= margin + ulW;
     GetDlgItem(IDC_BTN_UPLOAD)->SetWindowPos(NULL,
         rx, margin, ulW, btnH, SWP_NOZORDER);
-    // Language toggle
-    rx -= margin + lnW;
-    GetDlgItem(IDC_BTN_LANG)->SetWindowPos(NULL,
-        rx, margin, lnW, btnH, SWP_NOZORDER);
 
     // Content area — below tab strip, above status bar.
     int listTop    = margin + tabH + margin;

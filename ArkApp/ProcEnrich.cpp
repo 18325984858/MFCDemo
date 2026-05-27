@@ -144,8 +144,8 @@ static CString GetFileSignStatus(LPCTSTR path)
     wd.dwStateAction = WTD_STATEACTION_CLOSE;
     WinVerifyTrust(NULL, &policyGuid, &wd);
 
-    return (r == ERROR_SUCCESS) ? CString(_T("已签名"))
-                                : CString(_T("未签名"));
+    return (r == ERROR_SUCCESS) ? CString(_T("Signed"))
+                                : CString(_T("Unsigned"));
 }
 
 // ---------- CommandLine via NtQueryInformationProcess(ProcessCommandLineInformation=60) ----------

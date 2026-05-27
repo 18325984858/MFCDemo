@@ -7,7 +7,7 @@ struct ArkEnrich
 {
     CString UserName;        // "domain\\user"
     CString FileVendor;      // CompanyName from version info
-    CString SignStatus;      // "已签名" / "未签名" / "-"
+    CString SignStatus;      // "Signed" / "Unsigned" / "-"
     CString CommandLine;     // raw cmdline of process
 };
 

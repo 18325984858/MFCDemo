@@ -19,7 +19,6 @@ protected:
     afx_msg void OnBnClickedRefresh();
     afx_msg void OnBnClickedDownload();
     afx_msg void OnBnClickedUpload();
-    afx_msg void OnBnClickedLang();
     afx_msg void OnTabSelChange(NMHDR* pNMHDR, LRESULT* pResult);
     afx_msg void OnTreeItemExpanding(NMHDR* pNMHDR, LRESULT* pResult);
     afx_msg void OnTreeSelChanged(NMHDR* pNMHDR, LRESULT* pResult);
@@ -32,7 +31,6 @@ protected:
 private:
     void SendDriverCommand(LPCSTR command, LPCTSTR label);
     int  CurrentTab() const;
-    void ApplyLanguage();
     // Translate "\Device\HarddiskVolumeN\..." or "\SystemRoot\..." or
     // "\??\..." into a DOS path ("C:\..."). Leaves DOS paths unchanged.
     CString NtPathToDos(const CString& nt) const;
@@ -112,5 +110,4 @@ private:
     std::vector<BYTE> m_shotChunkSeen;
     HBITMAP    m_hShotBitmap   = NULL;
     bool       m_shotLive      = false;
-    bool       m_isEnglish     = false;
 };

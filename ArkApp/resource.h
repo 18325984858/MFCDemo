@@ -10,5 +10,4 @@
 #define IDC_FILE_TREE         1006
 #define IDC_FILE_LIST         1007
 #define IDC_SHOT_VIEW         1010
-#define IDC_BTN_LANG          1011
 #define IDC_STATUS_TEXT       1005
