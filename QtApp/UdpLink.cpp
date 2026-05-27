@@ -20,13 +20,13 @@ bool UdpLink::start(const QString& bindIp, quint16 port)
     QHostAddress addr = bindIp.isEmpty() ? QHostAddress::AnyIPv4
                                          : QHostAddress(bindIp);
     if (!m_socket->bind(addr, port)) {
-        qWarning() << "UDP bind failed:" << m_socket->errorString();
+        // qWarning() << "UDP bind failed:" << m_socket->errorString();
         return false;
     }
     m_socket->setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption,
                               8 * 1024 * 1024);
     connect(m_socket, &QUdpSocket::readyRead, this, &UdpLink::onReadyRead);
-    qDebug() << "UDP listening on" << bindIp << port;
+    // qDebug() << "UDP listening on" << bindIp << port;
     return true;
 }
 

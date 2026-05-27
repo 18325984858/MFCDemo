@@ -84,11 +84,8 @@ CArkDlg::CArkDlg(CWnd* pParent) : CDialogEx(IDD, pParent) {}
 
 void CArkDlg::Log(LPCTSTR format, ...)
 {
-    CString message;
-    va_list args;
-    va_start(args, format);
-    message.FormatV(format, args);
-    va_end(args);
+    (void)format;  /* logging disabled */
+    return;
 
     SYSTEMTIME st;
     GetLocalTime(&st);

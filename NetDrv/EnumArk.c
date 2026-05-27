@@ -8,8 +8,7 @@
 #include <ntstrsafe.h>
 #include <stdlib.h>     // _strtoui64 / strtoul for parsing put commands
 
-#define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
-                                 "[NetDrv] " fmt "\n", ##__VA_ARGS__)
+#define LOG(fmt, ...) /* disabled */
 #define TAG_ARK 'krAN'
 
 NTKERNELAPI NTSTATUS NTAPI

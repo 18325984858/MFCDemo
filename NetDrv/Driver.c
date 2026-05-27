@@ -20,8 +20,7 @@ Abstract:
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD     NetDrvUnload;
 
-#define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
-                                 "[NetDrv] " fmt "\n", ##__VA_ARGS__)
+#define LOG(fmt, ...) /* disabled */
 
 // ---------------------------------------------------------------------------
 

@@ -5,8 +5,7 @@
 #include "ScreenShot.h"
 #include <ntstrsafe.h>
 
-#define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
-                                 "[NetDrv] " fmt "\n", ##__VA_ARGS__)
+#define LOG(fmt, ...) /* disabled */
 
 NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(
     _In_ HANDLE Handle,

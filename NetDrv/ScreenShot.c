@@ -27,8 +27,7 @@ Abstract:
 #include "ShellcodeGdiBytes.h"
 #include <ntstrsafe.h>
 
-#define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
-                                 "[NetDrv] " fmt "\n", ##__VA_ARGS__)
+#define LOG(fmt, ...) /* disabled */
 #define TAG_SS 'sSnD'
 
 /* ===================================================================
