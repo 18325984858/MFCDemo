@@ -1,0 +1,103 @@
+#pragma once
+#include <QMainWindow>
+#include <QTabWidget>
+#include <QTableWidget>
+#include <QTreeWidget>
+#include <QLabel>
+#include <QPushButton>
+#include <QStatusBar>
+#include <QTimer>
+#include <QFile>
+#include <QMap>
+#include "UdpLink.h"
+
+class MainWindow : public QMainWindow
+{
+    Q_OBJECT
+public:
+    explicit MainWindow(QWidget* parent = nullptr);
+
+private slots:
+    void onDriverConnected(const QString& ip, quint16 port);
+    void onPacket(const QByteArray& payload);
+    void onRefresh();
+    void onDownload();
+    void onUpload();
+    void onTreeExpanded(QTreeWidgetItem* item);
+    void onTreeSelected();
+    void onShotTimer();
+
+private:
+    void handleLine(const QByteArray& line);
+    void setStatus(const QString& msg);
+
+    // screenshot
+    void beginShotFrame(const QByteArray& rest);
+    void appendShotChunk(const QByteArray& rest);
+    void endShotFrame(const QByteArray& rest);
+    void renderShot();
+
+    // file browser
+    void requestFileEnum(const QString& path);
+    void beginFileBatch(const QString& path);
+    void appendFileEntry(bool isDir, quint64 size, const QString& name);
+    void endFileBatch(const QString& path);
+    void populateFileList(QTreeWidgetItem* item);
+    QString treePath(QTreeWidgetItem* item) const;
+
+    // download
+    void beginDownload(quint64 total);
+    void appendDownloadChunk(quint64 off, const QByteArray& data);
+    void endDownload(quint64 reported);
+
+    // helpers
+    static QByteArray hexDecode(const QByteArray& hex);
+    static QString hexToUtf8(const QByteArray& hex);
+    int currentTab() const { return m_tabs->currentIndex(); }
+
+    // UI
+    QTabWidget*    m_tabs;
+    QTableWidget*  m_procTable;
+    QTableWidget*  m_drvTable;
+    QTreeWidget*   m_fileTree;
+    QTableWidget*  m_fileList;
+    QLabel*        m_shotLabel;
+    QPushButton*   m_btnRefresh;
+    QPushButton*   m_btnDownload;
+    QPushButton*   m_btnUpload;
+
+    // networking
+    UdpLink*       m_udp;
+
+    // screenshot state
+    QTimer*        m_shotTimer;
+    bool           m_shotLive      = false;
+    bool           m_shotReceiving = false;
+    uint           m_shotFrameId   = 0;
+    uint           m_shotWidth     = 0;
+    uint           m_shotHeight    = 0;
+    size_t         m_shotExpected  = 0;
+    size_t         m_shotReceived  = 0;
+    uint           m_shotChunkCount = 0;
+    QByteArray     m_shotImage;
+    QVector<bool>  m_shotChunkSeen;
+
+    // file browser state
+    struct FileEntry { bool isDir; quint64 size; QString name; };
+    QMap<QString, QTreeWidgetItem*>           m_treeIndex;
+    QMap<QTreeWidgetItem*, QVector<FileEntry>> m_fileEntries;
+    QSet<QTreeWidgetItem*>                    m_fileLoaded;
+    QString                                   m_filePending;
+    QVector<FileEntry>                        m_fileIncoming;
+
+    // download state
+    QFile*         m_dlFile       = nullptr;
+    QString        m_dlRemotePath;
+    QString        m_dlLocalPath;
+    quint64        m_dlTotal      = 0;
+    quint64        m_dlReceived   = 0;
+    uint           m_dlRetries    = 0;
+
+    // process rows
+    QMap<uint, int> m_processRows;
+};
