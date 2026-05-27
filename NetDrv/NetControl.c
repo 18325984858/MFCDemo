@@ -18,6 +18,10 @@ static volatile LONG g_ControlStop = 0;
 static KEVENT g_CommandEvent;
 static KSPIN_LOCK g_CommandLock;
 
+/* Async thread tracking: count active threads, signal when all done. */
+static volatile LONG g_AsyncCount = 0;
+static KEVENT g_AsyncDone;
+
 // Command FIFO. Each slot holds one datagram (post-magic). A single slot was
 // fine when only sparse control commands flowed, but file upload sends thousands
 // of P| chunks back-to-back, so we need a queue to avoid drops.
@@ -71,15 +75,25 @@ static VOID AsyncCmdThread(_In_ PVOID Context)
     }
 
     ExFreePoolWithTag(ac, 'dmcA');
+
+    /* Decrement async count; signal if last thread done. */
+    if (InterlockedDecrement(&g_AsyncCount) == 0)
+        KeSetEvent(&g_AsyncDone, IO_NO_INCREMENT, FALSE);
+
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 static VOID NetDrvDispatchAsync(_In_z_ PCSTR cmd)
 {
+    /* Reject if shutting down */
+    if (InterlockedCompareExchange(&g_ControlStop, 0, 0) != 0) return;
+
     ASYNC_CMD* ac = (ASYNC_CMD*)ExAllocatePool2(
         POOL_FLAG_NON_PAGED, sizeof(ASYNC_CMD), 'dmcA');
     if (!ac) { LOG("async dispatch: alloc failed"); return; }
     RtlStringCbCopyA(ac->Command, sizeof(ac->Command), cmd);
+
+    InterlockedIncrement(&g_AsyncCount);
 
     HANDLE hThread = NULL;
     NTSTATUS st = PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS,
@@ -89,6 +103,8 @@ static VOID NetDrvDispatchAsync(_In_z_ PCSTR cmd)
     } else {
         LOG("async dispatch: PsCreateSystemThread failed 0x%08X", st);
         ExFreePoolWithTag(ac, 'dmcA');
+        if (InterlockedDecrement(&g_AsyncCount) == 0)
+            KeSetEvent(&g_AsyncDone, IO_NO_INCREMENT, FALSE);
     }
 }
 
@@ -326,6 +342,7 @@ NTSTATUS NetDrvStartControlListener(VOID)
 
     InterlockedExchange(&g_ControlStop, 0);
     KeInitializeEvent(&g_CommandEvent, SynchronizationEvent, FALSE);
+    KeInitializeEvent(&g_AsyncDone, NotificationEvent, TRUE);  /* initially signaled = no threads */
     KeInitializeSpinLock(&g_CommandLock);
     g_CmdHead = 0;
     g_CmdTail = 0;
@@ -362,6 +379,15 @@ VOID NetDrvStopControlListener(VOID)
     ZwWaitForSingleObject(g_ControlThread, FALSE, NULL);
     ZwClose(g_ControlThread);
     g_ControlThread = NULL;
+
+    /* Wait for all async command threads to finish */
+    if (InterlockedCompareExchange(&g_AsyncCount, 0, 0) > 0) {
+        LOG("waiting for %ld async threads...", g_AsyncCount);
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -100000000LL;  /* 10 seconds max */
+        KeWaitForSingleObject(&g_AsyncDone, Executive, KernelMode, FALSE, &timeout);
+    }
+    LOG("all async threads done, async count=%ld", g_AsyncCount);
 }
 
 
