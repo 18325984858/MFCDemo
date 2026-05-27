@@ -72,6 +72,7 @@ private:
     QPushButton*   m_btnDownload;
     QPushButton*   m_btnUpload;
     QProgressBar*  m_progressBar;
+    QLabel*        m_progressLabel;
 
     // networking
     UdpLink*       m_udp;

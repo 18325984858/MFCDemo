@@ -3,7 +3,12 @@
 #include <QVariant>
 #include <QDebug>
 
-UdpLink::UdpLink(QObject* parent) : QObject(parent) {}
+UdpLink::UdpLink(QObject* parent) : QObject(parent)
+{
+    m_drainTimer = new QTimer(this);
+    m_drainTimer->setInterval(1);  // 1ms between queued sends
+    connect(m_drainTimer, &QTimer::timeout, this, &UdpLink::onDrainQueue);
+}
 
 bool UdpLink::start(const QString& bindIp, quint16 port)
 {
@@ -31,6 +36,27 @@ bool UdpLink::sendCommand(const QByteArray& command)
     pkt.append(command);
     qint64 sent = m_socket->writeDatagram(pkt, m_driverIp, m_driverPort);
     return sent == pkt.size();
+}
+
+void UdpLink::enqueue(const QByteArray& command)
+{
+    m_sendQueue.enqueue(command);
+    if (!m_drainTimer->isActive())
+        m_drainTimer->start();
+}
+
+void UdpLink::onDrainQueue()
+{
+    if (m_sendQueue.isEmpty() || !m_connected) {
+        m_drainTimer->stop();
+        return;
+    }
+    // Send up to 4 packets per tick to balance throughput and UI responsiveness
+    for (int i = 0; i < 4 && !m_sendQueue.isEmpty(); ++i) {
+        sendCommand(m_sendQueue.dequeue());
+    }
+    if (m_sendQueue.isEmpty())
+        m_drainTimer->stop();
 }
 
 void UdpLink::onReadyRead()

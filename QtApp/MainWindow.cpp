@@ -196,12 +196,16 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
     m_shotLabel->setMinimumSize(320, 200);
     m_tabs->addTab(m_shotLabel, "Screenshot");
 
-    // Progress bar — below tabs, above status bar, visible from any tab
+    // Progress area: label + bar, below tabs
+    m_progressLabel = new QLabel;
+    m_progressLabel->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    m_progressLabel->setStyleSheet("font-size: 11px; padding-left: 4px;");
+    m_progressLabel->hide();
     m_progressBar = new QProgressBar;
-    m_progressBar->setTextVisible(true);
-    m_progressBar->setAlignment(Qt::AlignCenter);
-    m_progressBar->setFixedHeight(22);
+    m_progressBar->setTextVisible(false);
+    m_progressBar->setFixedHeight(16);
     m_progressBar->hide();
+    vbox->addWidget(m_progressLabel);
     vbox->addWidget(m_progressBar);
 
     // status bar
@@ -752,8 +756,10 @@ void MainWindow::onDownload()
     // Show download progress
     m_progressBar->setRange(0, 100);
     m_progressBar->setValue(0);
-    m_progressBar->setFormat(QString("Download: %1  0%%").arg(name));
+    m_progressBar->setTextVisible(false);
     m_progressBar->show();
+    m_progressLabel->setText(QString("Download: %1").arg(name));
+    m_progressLabel->show();
 
     QByteArray cmd = QByteArray(NETDRV_CMD_GET_FILE) + remotePath.toUtf8() + "\n";
     m_udp->sendCommand(cmd);
@@ -784,7 +790,7 @@ void MainWindow::appendDownloadChunk(quint64 off, const QByteArray& data)
     if (m_dlTotal > 0 && m_progressBar->isVisible()) {
         int pct = (int)(m_dlReceived * 100 / m_dlTotal);
         m_progressBar->setValue(pct);
-        m_progressBar->setFormat(QString("Download: %1%%  %2/%3")
+        m_progressLabel->setText(QString("Download: %1%%  %2/%3")
             .arg(pct).arg(m_dlReceived).arg(m_dlTotal));
     }
 }
@@ -814,6 +820,7 @@ void MainWindow::endDownload(quint64 reported)
                   .arg(m_dlReceived).arg(reported).arg(m_dlLocalPath));
     m_dlRetries = 0;
     m_progressBar->hide();
+    m_progressLabel->hide();
 }
 
 // ---- upload ----
@@ -846,18 +853,19 @@ void MainWindow::onUpload()
         + "|" + QByteArray::number(total, 16).toUpper()
         + "|" + QByteArray::number(chunkSize)
         + "|" + QByteArray::number(chunkCount) + "\n";
-    m_udp->sendCommand(putCmd);
+    m_udp->enqueue(putCmd);
 
     // Show upload progress
-    m_progressBar->setRange(0, 100);
+    m_progressBar->setRange(0, (int)chunkCount);
     m_progressBar->setValue(0);
-    m_progressBar->setFormat(QString("Upload: %1  0%%").arg(fileName));
+    m_progressBar->setTextVisible(false);
     m_progressBar->show();
+    m_progressLabel->setText(QString("Upload: %1  0/%2").arg(fileName).arg(total));
+    m_progressLabel->show();
 
     static const char kHex[] = "0123456789ABCDEF";
     quint64 sent = 0;
     uint idx = 0;
-    QThread::msleep(10);
 
     while (sent < total) {
         QByteArray chunk = f.read(chunkSize);
@@ -874,29 +882,29 @@ void MainWindow::onUpload()
             + "|" + QByteArray::number(sent, 16).toUpper()
             + "|" + QByteArray::number(chunk.size(), 16).toUpper()
             + "|" + hex + "\n";
-        m_udp->sendCommand(pkt);
+        m_udp->enqueue(pkt);
 
         sent += chunk.size();
         ++idx;
         if ((idx & 0xF) == 0) {
-            int pct = (int)(sent * 100 / total);
-            m_progressBar->setValue(pct);
-            m_progressBar->setFormat(QString("Upload: %1%%  %2/%3")
-                .arg(pct).arg(sent).arg(total));
+            m_progressBar->setValue(idx);
+            m_progressLabel->setText(QString("Upload: %1%%  %2/%3")
+                .arg((int)(sent * 100 / total)).arg(sent).arg(total));
             setStatus(QString("[put] %1 / %2").arg(sent).arg(total));
             QApplication::processEvents();
-            QThread::msleep(2);
         }
     }
     f.close();
 
     QByteArray endCmd = QByteArray(NETDRV_CMD_PUT_END) + remotePath.toUtf8()
         + "|" + QByteArray::number(total, 16).toUpper() + "\n";
-    m_udp->sendCommand(endCmd);
-    m_progressBar->setValue(100);
-    m_progressBar->setFormat("Upload: 100%% Complete");
-    QThread::msleep(500);
-    m_progressBar->hide();
+    m_udp->enqueue(endCmd);
+    m_progressBar->setValue(m_progressBar->maximum());
+    m_progressLabel->setText("Upload: 100% Complete");
+    QTimer::singleShot(1000, this, [this]{
+        m_progressBar->hide();
+        m_progressLabel->hide();
+    });
     setStatus(QString("[put] sent %1 bytes (%2 chunks) -> %3")
               .arg(sent).arg(idx).arg(remotePath));
 }
