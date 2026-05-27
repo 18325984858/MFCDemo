@@ -25,13 +25,20 @@ signals:
 
 private slots:
     void onReadyRead();
-    void onDrainQueue();
+    void onDrainSend();
+    void onDrainRecv();
 
 private:
     QUdpSocket* m_socket = nullptr;
     bool        m_connected = false;
     QHostAddress m_driverIp;
     quint16      m_driverPort = 0;
+
+    // send queue
     QQueue<QByteArray> m_sendQueue;
-    QTimer*     m_drainTimer = nullptr;
+    QTimer*     m_sendTimer = nullptr;
+
+    // receive queue
+    QQueue<QByteArray> m_recvQueue;
+    QTimer*     m_recvTimer = nullptr;
 };

@@ -5,9 +5,13 @@
 
 UdpLink::UdpLink(QObject* parent) : QObject(parent)
 {
-    m_drainTimer = new QTimer(this);
-    m_drainTimer->setInterval(1);  // 1ms between queued sends
-    connect(m_drainTimer, &QTimer::timeout, this, &UdpLink::onDrainQueue);
+    m_sendTimer = new QTimer(this);
+    m_sendTimer->setInterval(1);
+    connect(m_sendTimer, &QTimer::timeout, this, &UdpLink::onDrainSend);
+
+    m_recvTimer = new QTimer(this);
+    m_recvTimer->setInterval(1);
+    connect(m_recvTimer, &QTimer::timeout, this, &UdpLink::onDrainRecv);
 }
 
 bool UdpLink::start(const QString& bindIp, quint16 port)
@@ -28,10 +32,7 @@ bool UdpLink::start(const QString& bindIp, quint16 port)
 
 bool UdpLink::sendCommand(const QByteArray& command)
 {
-    if (!m_connected || !m_socket) {
-        qDebug() << "sendCommand: driver not connected";
-        return false;
-    }
+    if (!m_connected || !m_socket) return false;
     QByteArray pkt(NETDRV_UDP_PACKET_MAGIC, NETDRV_UDP_PACKET_MAGIC_LEN);
     pkt.append(command);
     qint64 sent = m_socket->writeDatagram(pkt, m_driverIp, m_driverPort);
@@ -41,24 +42,24 @@ bool UdpLink::sendCommand(const QByteArray& command)
 void UdpLink::enqueue(const QByteArray& command)
 {
     m_sendQueue.enqueue(command);
-    if (!m_drainTimer->isActive())
-        m_drainTimer->start();
+    if (!m_sendTimer->isActive())
+        m_sendTimer->start();
 }
 
-void UdpLink::onDrainQueue()
+/* ---- Send queue: 4 packets per tick ---- */
+void UdpLink::onDrainSend()
 {
     if (m_sendQueue.isEmpty() || !m_connected) {
-        m_drainTimer->stop();
+        m_sendTimer->stop();
         return;
     }
-    // Send up to 4 packets per tick to balance throughput and UI responsiveness
-    for (int i = 0; i < 4 && !m_sendQueue.isEmpty(); ++i) {
+    for (int i = 0; i < 4 && !m_sendQueue.isEmpty(); ++i)
         sendCommand(m_sendQueue.dequeue());
-    }
     if (m_sendQueue.isEmpty())
-        m_drainTimer->stop();
+        m_sendTimer->stop();
 }
 
+/* ---- Receive: read all datagrams into queue (fast, no parsing) ---- */
 void UdpLink::onReadyRead()
 {
     while (m_socket->hasPendingDatagrams()) {
@@ -76,7 +77,7 @@ void UdpLink::onReadyRead()
         QByteArray payload = buf.mid(NETDRV_UDP_PACKET_MAGIC_LEN);
         if (payload.isEmpty()) continue;
 
-        // R|hello / R|ping — driver registration
+        // R|hello / R|ping: handle immediately (tiny, must not be delayed)
         if (payload.size() >= 2 && payload[0] == 'R' && payload[1] == '|') {
             bool wasConnected = m_connected;
             m_driverIp   = peer;
@@ -87,6 +88,22 @@ void UdpLink::onReadyRead()
             continue;
         }
 
-        emit packetReceived(payload);
+        m_recvQueue.enqueue(payload);
     }
+
+    if (!m_recvQueue.isEmpty() && !m_recvTimer->isActive())
+        m_recvTimer->start();
+}
+
+/* ---- Receive queue: process up to 32 packets per tick ---- */
+void UdpLink::onDrainRecv()
+{
+    if (m_recvQueue.isEmpty()) {
+        m_recvTimer->stop();
+        return;
+    }
+    for (int i = 0; i < 32 && !m_recvQueue.isEmpty(); ++i)
+        emit packetReceived(m_recvQueue.dequeue());
+    if (m_recvQueue.isEmpty())
+        m_recvTimer->stop();
 }
