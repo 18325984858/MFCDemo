@@ -1,0 +1,43 @@
+;
+; NetDrv.inf - Winsock Kernel (WSK) network demo driver
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %ManufacturerName%
+DriverVer   =
+CatalogFile = NetDrv.cat
+PnpLockDown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12   ; %WinDir%\System32\drivers
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+NetDrv.sys = 1,,
+
+[DefaultInstall.NTamd64]
+OptionDesc = %ServiceDesc%
+CopyFiles  = NetDrv.CopyFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService = NetDrv,, NetDrv.Service
+
+[NetDrv.CopyFiles]
+NetDrv.sys
+
+[NetDrv.Service]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1                 ; SERVICE_KERNEL_DRIVER
+StartType      = 3                 ; SERVICE_DEMAND_START
+ErrorControl   = 1                 ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\NetDrv.sys
+
+[Strings]
+ManufacturerName = "Sample"
+DiskName         = "NetDrv Install Disk"
+ServiceDesc      = "NetDrv WSK Sample Driver"
