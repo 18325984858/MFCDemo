@@ -14,8 +14,7 @@ CArkApp theApp;
 
 static void AgentLog(LPCTSTR format, ...)
 {
-    (void)format;  /* logging disabled */
-    return;
+#if 0  /* logging disabled */
 
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -53,6 +52,7 @@ static void AgentLog(LPCTSTR format, ...)
         WriteFile(file, utf8.data(), (DWORD)utf8.size(), &written, NULL);
     }
     CloseHandle(file);
+#endif  /* logging disabled */
 }
 
 static bool AgentSendPacket(SOCKET sock,

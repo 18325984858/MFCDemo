@@ -48,6 +48,7 @@ echo.
 echo [3/3] Building ArkQt.exe ...
 cd /d "%ROOT%QtApp"
 if not exist build mkdir build
+if not exist "%ROOT%deploy" mkdir "%ROOT%deploy"
 cd build
 cmake .. -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=C:/Qt/6.8.2/msvc2022_64 >nul 2>&1
 cmake --build . --config Release

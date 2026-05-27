@@ -84,8 +84,7 @@ CArkDlg::CArkDlg(CWnd* pParent) : CDialogEx(IDD, pParent) {}
 
 void CArkDlg::Log(LPCTSTR format, ...)
 {
-    (void)format;  /* logging disabled */
-    return;
+#if 0  /* logging disabled */
 
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -132,6 +131,7 @@ void CArkDlg::Log(LPCTSTR format, ...)
         WriteFile(file, utf8.data(), (DWORD)utf8.size(), &written, NULL);
     }
     CloseHandle(file);
+#endif  /* logging disabled */
 }
 
 void CArkDlg::DoDataExchange(CDataExchange* pDX)

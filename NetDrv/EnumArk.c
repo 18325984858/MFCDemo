@@ -129,6 +129,8 @@ ArkUdpOpenTo(_Out_ PARK_UDP_CHANNEL ch,
     SOCKADDR_IN local = { 0 };
     SIZE_T sent = 0;
 
+    UNREFERENCED_PARAMETER(peerName);
+
     RtlZeroMemory(ch, sizeof(*ch));
 
     status = WSK_socket(&ch->Sock, AF_INET, SOCK_DGRAM, IPPROTO_UDP,
@@ -180,6 +182,7 @@ static VOID ArkUdpSendLine(_In_ PARK_UDP_CHANNEL ch, _In_ PCSTR text);
 static VOID
 ArkUdpTriggerAgent(_In_z_ PCSTR command, _In_z_ PCSTR label)
 {
+    UNREFERENCED_PARAMETER(label);
     ARK_UDP_CHANNEL agentCh;
     NTSTATUS status = ArkUdpOpenTo(&agentCh,
                                    NETDRV_DRIVER_IP_B1, NETDRV_DRIVER_IP_B2,
