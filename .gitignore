@@ -24,11 +24,6 @@ Release/
 QtApp/build/
 deploy/
 
-# Qt runtime deployed to root
-platforms/
-styles/
-imageformats/
-tls/
-generic/
-iconengines/
-networkinformation/
+# ArkApp intermediate
+ArkApp/ArkApp/
+ArkApp/x64/
