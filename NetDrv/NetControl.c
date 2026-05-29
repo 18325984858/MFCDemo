@@ -4,8 +4,10 @@
 #include "EnumArk.h"
 #include "ScreenShot.h"
 #include <ntstrsafe.h>
+#include "../Shared/NdarkLog.h"
+#include "CompatPool.h"
 
-#define LOG(fmt, ...) /* disabled */
+#define LOG(fmt, ...) NDARK_LOG_INFO(fmt, ##__VA_ARGS__)
 
 NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(
     _In_ HANDLE Handle,
@@ -13,7 +15,7 @@ NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(
     _In_opt_ PLARGE_INTEGER Timeout);
 
 static HANDLE g_ControlThread = NULL;
-static volatile LONG g_ControlStop = 0;
+volatile LONG g_ControlStop = 0;
 static KEVENT g_CommandEvent;
 static KSPIN_LOCK g_CommandLock;
 
@@ -92,6 +94,7 @@ static VOID NetDrvDispatchAsync(_In_z_ PCSTR cmd)
     if (!ac) { LOG("async dispatch: alloc failed"); return; }
     RtlStringCbCopyA(ac->Command, sizeof(ac->Command), cmd);
 
+    KeClearEvent(&g_AsyncDone);
     InterlockedIncrement(&g_AsyncCount);
 
     HANDLE hThread = NULL;
@@ -132,9 +135,19 @@ static VOID NetDrvHandleCommand(_In_z_ PCSTR cmd)
     } else if (strncmp(cmd, NETDRV_CMD_STOP, strlen(NETDRV_CMD_STOP)) == 0) {
         LOG("UDP command: stop");
         InterlockedExchange(&g_ControlStop, 1);
+    } else if (strncmp(cmd, NETDRV_CMD_SHOT_KEYFRAME, strlen(NETDRV_CMD_SHOT_KEYFRAME)) == 0) {
+        InterlockedExchange(&g_ForceKeyframe, 1);
     } else {
         LOG("UDP command ignored: unknown '%.40s'", cmd);
     }
+}
+
+/* Public entry point for TCP link --- payload is already NUL-terminated. */
+VOID NetDrvDispatchCommand(_In_reads_bytes_(Len) const CHAR* Payload, _In_ ULONG Len)
+{
+    UNREFERENCED_PARAMETER(Len);
+    /* Payload is NUL-terminated by TcpLink; reuse existing handler. */
+    NetDrvHandleCommand(Payload);
 }
 
 static VOID NetDrvQueueCommand(_In_reads_bytes_(length) const CHAR* text,
@@ -367,24 +380,19 @@ NTSTATUS NetDrvStartControlListener(VOID)
 
 VOID NetDrvStopControlListener(VOID)
 {
-    if (!g_ControlThread) {
-        LOG("control listener stop skipped: no thread");
-        return;
-    }
-
     LOG("control listener stopping");
     InterlockedExchange(&g_ControlStop, 1);
     KeSetEvent(&g_CommandEvent, IO_NO_INCREMENT, FALSE);
-    ZwWaitForSingleObject(g_ControlThread, FALSE, NULL);
-    ZwClose(g_ControlThread);
-    g_ControlThread = NULL;
+    if (g_ControlThread) {
+        ZwWaitForSingleObject(g_ControlThread, FALSE, NULL);
+        ZwClose(g_ControlThread);
+        g_ControlThread = NULL;
+    }
 
     /* Wait for all async command threads to finish */
     if (InterlockedCompareExchange(&g_AsyncCount, 0, 0) > 0) {
         LOG("waiting for %ld async threads...", g_AsyncCount);
-        LARGE_INTEGER timeout;
-        timeout.QuadPart = -100000000LL;  /* 10 seconds max */
-        KeWaitForSingleObject(&g_AsyncDone, Executive, KernelMode, FALSE, &timeout);
+        KeWaitForSingleObject(&g_AsyncDone, Executive, KernelMode, FALSE, NULL);
     }
     LOG("all async threads done, async count=%ld", g_AsyncCount);
 }
@@ -392,6 +400,4 @@ VOID NetDrvStopControlListener(VOID)
 
 //netsh advfirewall firewall add rule name="NetDrv UDP 9999 In" dir=in action=allow protocol=UDP localport=9999
 //netsh advfirewall firewall add rule name="ArkApp UDP 9999 In" dir=in action=allow protocol=UDP localport=9999
-
-
 //netsh advfirewall firewall add rule name="ArkApp UDP 9998 In" dir=in action=allow protocol=UDP localport=9998

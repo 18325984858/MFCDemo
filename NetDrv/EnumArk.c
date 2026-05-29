@@ -4,11 +4,14 @@
 
 #include "EnumArk.h"
 #include "Wsk.h"
+#include "TcpLink.h"
 #include "Ioctl.h"
 #include <ntstrsafe.h>
 #include <stdlib.h>     // _strtoui64 / strtoul for parsing put commands
+#include "../Shared/NdarkLog.h"
+#include "CompatPool.h"
 
-#define LOG(fmt, ...) /* disabled */
+#define LOG(fmt, ...) NDARK_LOG_INFO(fmt, ##__VA_ARGS__)
 #define TAG_ARK 'krAN'
 
 NTKERNELAPI NTSTATUS NTAPI
@@ -213,10 +216,24 @@ ArkUdpClose(_Inout_ PARK_UDP_CHANNEL ch)
 static VOID
 ArkUdpSendLine(_In_ PARK_UDP_CHANNEL ch, _In_ PCSTR text)
 {
-    if (!ch->Sock || !text) return;
+    if (!text) return;
     SIZE_T payloadLen = strlen(text);
+    if (payloadLen == 0) return;
+
+    /* Prefer TCP when connected --- no magic prefix needed, just raw payload */
+    if (TcpLinkIsConnected() || TcpLinkIsScreenConnected() || TcpLinkIsFileConnected()) {
+        NTSTATUS st = TcpLinkSend(text, (ULONG)payloadLen);
+        if (NT_SUCCESS(st)) {
+            ++ch->SentLines;
+            ch->SentBytes += payloadLen;
+            return;
+        }
+        /* Fall through to UDP on TCP send failure */
+    }
+
+    if (!ch->Sock) { ++ch->FailedLines; return; }
     SIZE_T packetLen = NETDRV_UDP_PACKET_MAGIC_LEN + payloadLen;
-    if (payloadLen == 0 || packetLen > 1400) {
+    if (packetLen > 1400) {
         ++ch->FailedLines;
         LOG("ArkUdpSendLine: reject payloadLen=%Iu packetLen=%Iu", payloadLen, packetLen);
         return;
@@ -799,7 +816,9 @@ done:
 
 // Download/upload binary chunk size in source bytes (hex-encoded on the wire,
 // so each UDP packet is roughly 2 x this + ~32 bytes of framing).
-#define NETDRV_IO_CHUNK_BYTES 512
+#define NETDRV_IO_CHUNK_BYTES     512
+// TCP can handle much larger chunks -- no UDP MTU limit, no hex overhead concern.
+#define NETDRV_IO_CHUNK_BYTES_TCP 32768
 
 NTSYSAPI NTSTATUS NTAPI ZwReadFile(
     _In_     HANDLE              FileHandle,
@@ -953,6 +972,7 @@ NTSTATUS NetDrvGetFile(_In_z_ PCSTR Utf8Path)
     NETDRV_FILE_STANDARD_INFO fsi = { 0 };
     UCHAR*          buf = NULL;
     UCHAR*          hexBuf = NULL;
+    PCHAR           lineBuf = NULL;
     CHAR            line[1400];
     CHAR            pathHex[600];
     ARK_UDP_CHANNEL ch;
@@ -1003,18 +1023,24 @@ NTSTATUS NetDrvGetFile(_In_z_ PCSTR Utf8Path)
     }
     chOpen = TRUE;
 
+    /* Pick chunk size: 32KB for TCP, 512B for UDP */
+    BOOLEAN useTcp = TcpLinkIsFileConnected();
+    ULONG ioChunk = useTcp ? NETDRV_IO_CHUNK_BYTES_TCP : NETDRV_IO_CHUNK_BYTES;
+
     {
-        ULONGLONG chunkCount = (total + NETDRV_IO_CHUNK_BYTES - 1) / NETDRV_IO_CHUNK_BYTES;
-        if (chunkCount == 0) chunkCount = 1; // emit at least header/end even for empty file
+        ULONGLONG chunkCount = (total + ioChunk - 1) / ioChunk;
+        if (chunkCount == 0) chunkCount = 1;
         RtlStringCbPrintfA(line, sizeof(line),
             "B|get|%s|%llX|%u|%llu\n",
-            pathHex, total, NETDRV_IO_CHUNK_BYTES, chunkCount);
+            pathHex, total, ioChunk, chunkCount);
         ArkUdpSendLine(&ch, line);
     }
 
-    buf    = (UCHAR*)ExAllocatePool2(POOL_FLAG_PAGED, NETDRV_IO_CHUNK_BYTES, TAG_ARK);
-    hexBuf = (UCHAR*)ExAllocatePool2(POOL_FLAG_PAGED, NETDRV_IO_CHUNK_BYTES * 2 + 2, TAG_ARK);
-    if (!buf || !hexBuf) {
+    buf    = (UCHAR*)ExAllocatePool2(POOL_FLAG_PAGED, ioChunk, TAG_ARK);
+    hexBuf = (UCHAR*)ExAllocatePool2(POOL_FLAG_PAGED, ioChunk * 2 + 2, TAG_ARK);
+    /* lineBuf must hold "G|idx|offHex|lenHex|" + hex data + "\n\0" */
+    lineBuf = (PCHAR)ExAllocatePool2(POOL_FLAG_PAGED, ioChunk * 2 + 128, TAG_ARK);
+    if (!buf || !hexBuf || !lineBuf) {
         status = STATUS_INSUFFICIENT_RESOURCES;
         goto done;
     }
@@ -1024,7 +1050,7 @@ NTSTATUS NetDrvGetFile(_In_z_ PCSTR Utf8Path)
         off.QuadPart = 0;
         for (;;) {
             NTSTATUS rs = ZwReadFile(hFile, NULL, NULL, NULL, &iosb,
-                buf, NETDRV_IO_CHUNK_BYTES, &off, NULL);
+                buf, ioChunk, &off, NULL);
             if (rs == STATUS_END_OF_FILE || iosb.Information == 0) {
                 break;
             }
@@ -1034,16 +1060,16 @@ NTSTATUS NetDrvGetFile(_In_z_ PCSTR Utf8Path)
                 break;
             }
             ULONG bytes = (ULONG)iosb.Information;
-            Utf8ToHexLineA(buf, bytes, (PCHAR)hexBuf, NETDRV_IO_CHUNK_BYTES * 2 + 2);
-            RtlStringCbPrintfA(line, sizeof(line),
+            Utf8ToHexLineA(buf, bytes, (PCHAR)hexBuf, ioChunk * 2 + 2);
+            RtlStringCbPrintfA(lineBuf, ioChunk * 2 + 128,
                 "G|%u|%llX|%X|%s\n", chunkIdx, (ULONGLONG)off.QuadPart, bytes, hexBuf);
-            ArkUdpSendLine(&ch, line);
+            ArkUdpSendLine(&ch, lineBuf);
             ++chunkIdx;
             sentBytes += bytes;
             off.QuadPart += bytes;
-            if (bytes < NETDRV_IO_CHUNK_BYTES) break;
-            // Pacing: 2 ms every 4 chunks to prevent UDP receiver overflow.
-            if ((chunkIdx & 3) == 3) {
+            if (bytes < ioChunk) break;
+            /* Pacing: only throttle for UDP (small chunks flood the receiver) */
+            if (!useTcp && (chunkIdx & 3) == 3) {
                 LARGE_INTEGER sleep;
                 sleep.QuadPart = -20000; // 2 ms
                 KeDelayExecutionThread(KernelMode, FALSE, &sleep);
@@ -1052,8 +1078,9 @@ NTSTATUS NetDrvGetFile(_In_z_ PCSTR Utf8Path)
     }
 
 done:
-    if (buf)    ExFreePoolWithTag(buf,    TAG_ARK);
-    if (hexBuf) ExFreePoolWithTag(hexBuf, TAG_ARK);
+    if (buf)     ExFreePoolWithTag(buf,     TAG_ARK);
+    if (hexBuf)  ExFreePoolWithTag(hexBuf,  TAG_ARK);
+    if (lineBuf) ExFreePoolWithTag(lineBuf, TAG_ARK);
 
     RtlStringCbPrintfA(line, sizeof(line),
         "E|get|%s|%llu\n", pathHex, sentBytes);
@@ -1161,7 +1188,7 @@ NTSTATUS NetDrvPutChunk(_In_z_ PCSTR ChunkRest)
     ULONGLONG offset;
     ULONG     dataLen;
     SIZE_T    hexLen;
-    UCHAR     tmp[NETDRV_IO_CHUNK_BYTES];
+    PUCHAR    tmp = NULL;
     SIZE_T    decoded = 0;
     IO_STATUS_BLOCK iosb;
     LARGE_INTEGER off;
@@ -1191,19 +1218,23 @@ NTSTATUS NetDrvPutChunk(_In_z_ PCSTR ChunkRest)
            (dataStart[hexLen - 1] == '\r' || dataStart[hexLen - 1] == '\n')) {
         --hexLen;
     }
-    if (hexLen != (SIZE_T)dataLen * 2 || dataLen > NETDRV_IO_CHUNK_BYTES) {
+    if (hexLen != (SIZE_T)dataLen * 2 || dataLen > NETDRV_IO_CHUNK_BYTES_TCP) {
         LOG("PutChunk: bad sizes hex=%Iu len=%u", hexLen, dataLen);
         return STATUS_INVALID_PARAMETER;
     }
-    status = NetDrvHexDecodeA(dataStart, hexLen, tmp, sizeof(tmp), &decoded);
+    tmp = (PUCHAR)ExAllocatePool2(POOL_FLAG_PAGED, dataLen, TAG_ARK);
+    if (!tmp) return STATUS_INSUFFICIENT_RESOURCES;
+    status = NetDrvHexDecodeA(dataStart, hexLen, tmp, dataLen, &decoded);
     if (!NT_SUCCESS(status) || decoded != dataLen) {
         LOG("PutChunk: hex decode failed 0x%08X", status);
+        ExFreePoolWithTag(tmp, TAG_ARK);
         return STATUS_INVALID_PARAMETER;
     }
 
     off.QuadPart = (LONGLONG)offset;
     status = ZwWriteFile(g_PutHandle, NULL, NULL, NULL, &iosb,
                          tmp, dataLen, &off, NULL);
+    ExFreePoolWithTag(tmp, TAG_ARK);
     if (!NT_SUCCESS(status)) {
         CHAR line[160];
         RtlStringCbPrintfA(line, sizeof(line),

@@ -1,7 +1,7 @@
 @echo off
 setlocal
 echo ============================================
-echo  Build All: NetDrv + ArkApp + QtApp
+echo  Build All: NetDrv + QtApp
 echo ============================================
 
 :: Setup MSVC environment
@@ -16,7 +16,7 @@ set FAIL=0
 
 :: ---- Build NetDrv.sys ----
 echo.
-echo [1/3] Building NetDrv.sys ...
+echo [1/2] Building NetDrv.sys ...
 cd /d "%ROOT%NetDrv"
 msbuild NetDrv.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=false /p:SignMode=Off /p:InfVerif_NoError=true /t:Rebuild /v:m
 if errorlevel 1 (
@@ -30,22 +30,9 @@ if exist "%ROOT%NetDrv\x64\Release\NetDrv.sys" (
     set FAIL=1
 )
 
-:: ---- Build ArkApp.exe ----
-echo.
-echo [2/3] Building ArkApp.exe ...
-cd /d "%ROOT%ArkApp"
-msbuild ArkApp.vcxproj /p:Configuration=Release /p:Platform=x64 /t:Build /v:m
-if errorlevel 1 (
-    echo [FAIL] ArkApp build failed
-    set FAIL=1
-) else (
-    copy /y "%ROOT%ArkApp\x64\Release\ArkApp.exe" "%ROOT%ArkApp.exe" >nul
-    echo [OK] ArkApp.exe
-)
-
 :: ---- Build QtApp (ArkQt.exe) ----
 echo.
-echo [3/3] Building ArkQt.exe ...
+echo [2/2] Building ArkQt.exe ...
 cd /d "%ROOT%QtApp"
 if not exist build mkdir build
 if not exist "%ROOT%deploy" mkdir "%ROOT%deploy"
@@ -70,7 +57,6 @@ if %FAIL%==0 (
 )
 echo  Outputs:
 echo    NetDrv.sys  (root)
-echo    ArkApp.exe  (root)
 echo    ArkQt.exe   (deploy/)
 echo ============================================
 

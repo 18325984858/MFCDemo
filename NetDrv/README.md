@@ -1,6 +1,8 @@
 # NetDrv — WSK Network ARK Driver
 
-Minimal Winsock Kernel (WSK) driver for remote ARK-style system enumeration and screen capture over UDP.
+Minimal Winsock Kernel (WSK) driver for remote ARK-style system enumeration,
+file transfer, and screen capture over separated TCP channels with UDP kept as
+a legacy fallback.
 
 ## Files
 
@@ -11,6 +13,8 @@ Minimal Winsock Kernel (WSK) driver for remote ARK-style system enumeration and 
 | `NetControl.c/.h`| UDP command dispatcher (receive event callback + worker thread) |
 | `EnumArk.c/.h`   | Process / driver / file enumeration, file upload/download |
 | `ScreenShot.c/.h` | Pure-kernel screen capture via GDI shellcode injection into dwm.exe |
+| `TcpChannel.c/.h` | Reusable WSK TCP channel object: connect, auth, recv, send queue |
+| `TcpLink.c/.h`    | Control/screen/file TCP channel manager |
 | `ShellcodeGdi.c`  | PIC shellcode source (compiled separately, bytes embedded in driver) |
 | `Ioctl.h`        | Shared protocol constants (IPs, ports, commands) |
 | `NetDrv.inf`     | Install INF |
@@ -25,8 +29,19 @@ Minimal Winsock Kernel (WSK) driver for remote ARK-style system enumeration and 
 
 ## Protocol
 
-Driver listens on `NETDRV_DRIVER_IP:9999`, streams results to `NETDRV_APP_IP:9999`.
-All datagrams start with `NDARK1|` magic. Commands: `C|process`, `C|driver`, `C|file|<path>`, `C|get|<path>`, `C|put|...`, `C|screenshot`, `C|stop`.
+The preferred path is TCP, with three physical channels to avoid head-of-line
+blocking between realtime screen frames and bulk file transfer:
+
+| Channel | Port | Purpose |
+| --- | --- | --- |
+| control | `10000` | commands, heartbeat, process/driver results, small status |
+| screen | `10001` | screenshot requests and `B|shot2` / `Z|` / `E|shot2` frames |
+| file | `10002` | directory enumeration, upload, download chunks |
+
+All TCP messages use the shared `NDR2` length-prefixed frame format from
+`Shared/Protocol.h`. `Shared/ProtocolRoute.h` classifies app commands and driver
+payloads so both sides choose the same channel. UDP `9999` and `NDARK1|` framing
+remain as a fallback.
 
 ## Build
 

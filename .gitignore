@@ -27,3 +27,9 @@ deploy/
 # ArkApp intermediate
 ArkApp/ArkApp/
 ArkApp/x64/
+
+# Reverse-engineering / analysis dumps (regenerable)
+disasm_full.txt
+
+# Session memory & test artifacts that are user-local
+/memories/

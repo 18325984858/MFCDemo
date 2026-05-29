@@ -11,6 +11,7 @@
 #include <QFile>
 #include <QMap>
 #include "UdpLink.h"
+#include "TcpLink.h"
 
 class MainWindow : public QMainWindow
 {
@@ -27,6 +28,7 @@ private slots:
     void onTreeExpanded(QTreeWidgetItem* item);
     void onTreeSelected();
     void onShotTimer();
+    void pumpUpload();
 
 private:
     void handleLine(const QByteArray& line);
@@ -35,8 +37,10 @@ private:
     // screenshot
     void beginShotFrame(const QByteArray& rest);
     void appendShotChunk(const QByteArray& rest);
+    void appendShotChunkV2(const QByteArray& binPayload);
     void endShotFrame(const QByteArray& rest);
     void renderShot();
+    static QByteArray rleDecompress(const QByteArray& comp, quint32 dwordCount);
 
     // file browser
     void initFileTree();
@@ -51,6 +55,10 @@ private:
     void beginDownload(quint64 total);
     void appendDownloadChunk(quint64 off, const QByteArray& data);
     void endDownload(quint64 reported);
+
+    // upload
+    void resetUpload();
+    void finishUpload();
 
     // helpers
     static QByteArray hexDecode(const QByteArray& hex);
@@ -75,7 +83,8 @@ private:
     QLabel*        m_progressLabel;
 
     // networking
-    UdpLink*       m_udp;
+    UdpLink*       m_udp;     // legacy UDP (kept, not active)
+    TcpLink*       m_tcp;     // primary TCP link
 
     // screenshot state
     QTimer*        m_shotTimer;
@@ -89,6 +98,14 @@ private:
     uint           m_shotChunkCount = 0;
     QByteArray     m_shotImage;
     QVector<bool>  m_shotChunkSeen;
+
+    // V2 (diff+RLE+binary) state
+    bool           m_shotV2        = false;
+    bool           m_shotIsKey     = false;
+    size_t         m_shotCompSize  = 0;
+    size_t         m_shotCompRecv  = 0;
+    QByteArray     m_shotCompBuf;
+    QByteArray     m_shotPrevImage;
 
     // file browser state
     struct FileEntry { bool isDir; quint64 size; QString name; };
@@ -105,6 +122,18 @@ private:
     quint64        m_dlTotal      = 0;
     quint64        m_dlReceived   = 0;
     uint           m_dlRetries    = 0;
+
+    // upload state
+    QTimer*        m_uploadTimer  = nullptr;
+    QFile*         m_ulFile       = nullptr;
+    QString        m_ulRemotePath;
+    QString        m_ulFileName;
+    quint64        m_ulTotal      = 0;
+    quint64        m_ulSent       = 0;
+    uint           m_ulChunkSize  = 8192;
+    uint           m_ulChunkCount = 0;
+    uint           m_ulIndex      = 0;
+    bool           m_ulActive     = false;
 
     // process rows
     QMap<uint, int> m_processRows;

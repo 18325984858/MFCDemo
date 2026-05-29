@@ -11,11 +11,22 @@ endif()
 
 add_executable(ArkQt WIN32
     main.cpp
+    MainWindow.h
     MainWindow.cpp
+    NetLinkBase.h
+    NetLinkBase.cpp
+    TcpChannel.h
+    TcpChannel.cpp
+    TcpLink.h
+    UdpLink.h
     UdpLink.cpp
+    TcpLink.cpp
 )
 
-target_include_directories(ArkQt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../NetDrv)
+target_include_directories(ArkQt PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../NetDrv
+    ${CMAKE_CURRENT_SOURCE_DIR}/../Shared
+)
 
 target_link_libraries(ArkQt PRIVATE
     Qt::Widgets

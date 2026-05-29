@@ -29,14 +29,37 @@
     <ClCompile Include="NetControl.c" />
     <ClCompile Include="Wsk.c" />
     <ClCompile Include="ScreenShot.c" />
+    <ClCompile Include="TcpChannel.c" />
+    <ClCompile Include="TcpLink.c" />
+    <ClCompile Include="KernelCxx.cpp">
+      <CompileAs>CompileAsCpp</CompileAs>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <DisableSpecificWarnings>4530;4577;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <ExcludedFromBuild Condition="'$(NdarkNoCpp)'=='1'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="NetLink.cpp">
+      <CompileAs>CompileAsCpp</CompileAs>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <DisableSpecificWarnings>4530;4577;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <ExcludedFromBuild Condition="'$(NdarkNoCpp)'=='1'">true</ExcludedFromBuild>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EnumArk.h" />
+    <ClInclude Include="TcpChannel.h" />
+    <ClInclude Include="TcpLink.h" />
     <ClInclude Include="ScreenShot.h" />
     <ClInclude Include="ShellcodeGdiBytes.h" />
     <ClInclude Include="Ioctl.h" />
     <ClInclude Include="NetControl.h" />
     <ClInclude Include="Wsk.h" />
+    <ClInclude Include="NetLink.h" />
+    <ClInclude Include="NetLinkApi.h" />
+    <ClInclude Include="CompatPool.h" />
   </ItemGroup>
   <ItemGroup>
     <Inf Include="NetDrv.inf" />
@@ -46,6 +69,8 @@
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>
       <PreprocessorDefinitions>NDIS_WDM=1;POOL_NX_OPTIN=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(NdarkNoCpp)'=='1'">NDARK_NO_CPP=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\Shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <AdditionalDependencies>$(DDK_LIB_PATH)\netio.lib;%(AdditionalDependencies)</AdditionalDependencies>

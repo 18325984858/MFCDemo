@@ -16,3 +16,6 @@
 NTSTATUS NetDrvScreenCapture(VOID);
 VOID     NetDrvScreenCleanup(VOID);  /* call from DriverUnload */
 NTSTATUS NetDrvScreenCapture(VOID);
+
+/* App sets this to 1 to request a keyframe on next capture */
+extern volatile LONG g_ForceKeyframe;

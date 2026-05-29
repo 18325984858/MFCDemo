@@ -1,10 +1,11 @@
-#include "MainWindow.h"
+﻿#include "MainWindow.h"
 #include "Ioctl.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QSplitter>
 #include <QHeaderView>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QMessageBox>
 #include <QDateTime>
 #include <QImage>
@@ -20,6 +21,24 @@
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "version.lib")
 #endif
+
+// ---- shot diagnostic log ----
+#include <cstdio>
+#include <cstdarg>
+static FILE* g_shotLog = nullptr;
+static void shotLog(const char* fmt, ...)
+{
+    if (!g_shotLog) {
+        g_shotLog = fopen("shot_log.txt", "w");
+        if (!g_shotLog) return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_shotLog, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_shotLog);
+    fflush(g_shotLog);
+}
 
 // ---- helpers ----
 
@@ -224,13 +243,26 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
     m_shotTimer = new QTimer(this);
     connect(m_shotTimer, &QTimer::timeout, this, &MainWindow::onShotTimer);
 
-    // UDP
+    // upload pump: keeps file transfer from flooding the TCP write buffer
+    m_uploadTimer = new QTimer(this);
+    m_uploadTimer->setInterval(10);
+    connect(m_uploadTimer, &QTimer::timeout, this, &MainWindow::pumpUpload);
+
+    // UDP (legacy — kept but not started)
     m_udp = new UdpLink(this);
-    connect(m_udp, &UdpLink::driverConnected,
+    // m_udp->start("0.0.0.0", NETDRV_UDP_PORT);  // disabled: using TCP now
+
+    // TCP — primary link
+    m_tcp = new TcpLink(this);
+    connect(m_tcp, &TcpLink::driverConnected,
             this, &MainWindow::onDriverConnected);
-    connect(m_udp, &UdpLink::packetReceived,
+    connect(m_tcp, &TcpLink::packetReceived,
             this, &MainWindow::onPacket);
-    m_udp->start("0.0.0.0", NETDRV_UDP_PORT);
+    connect(m_tcp, &TcpLink::fileBytesWritten, this, [this](qint64){
+        if (m_ulActive && !m_uploadTimer->isActive())
+            m_uploadTimer->start();
+    });
+    m_tcp->startServer("0.0.0.0", NETDRV_TCP_PORT);
 
     buildDriveMap();
     initFileTree();
@@ -252,6 +284,12 @@ void MainWindow::onDriverConnected(const QString& ip, quint16 port)
 
 void MainWindow::onPacket(const QByteArray& payload)
 {
+    // Binary shot chunk: Z| prefix — do NOT split by \n
+    if (payload.size() >= 18 && payload[0] == 'Z' && payload[1] == '|') {
+        appendShotChunkV2(payload);
+        return;
+    }
+
     // split by newlines
     int start = 0;
     for (int i = 0; i <= payload.size(); ++i) {
@@ -280,6 +318,8 @@ void MainWindow::handleLine(const QByteArray& line)
             beginFileBatch(hexToUtf8(rest.mid(5)));
         } else if (rest.startsWith("shot|")) {
             beginShotFrame(rest.mid(5));
+        } else if (rest.startsWith("shot2|")) {
+            beginShotFrame(rest.mid(6));
         } else if (rest.startsWith("get|")) {
             // B|get|pathHex|totalHex|chunkSize|chunkCount
             auto parts = rest.mid(4).split('|');
@@ -298,6 +338,8 @@ void MainWindow::handleLine(const QByteArray& line)
             endFileBatch(hexToUtf8(hex));
         } else if (rest.startsWith("shot|")) {
             endShotFrame(rest.mid(5));
+        } else if (rest.startsWith("shot2|")) {
+            endShotFrame(rest.mid(6));
         } else if (rest.startsWith("get|")) {
             int p = rest.lastIndexOf('|');
             quint64 sent = (p > 0) ? rest.mid(p+1).toULongLong() : 0;
@@ -459,7 +501,7 @@ void MainWindow::handleLine(const QByteArray& line)
 
 void MainWindow::onRefresh()
 {
-    if (!m_udp->isDriverConnected()) {
+    if (!m_tcp->isDriverConnected()) {
         setStatus("Driver not connected");
         return;
     }
@@ -467,11 +509,11 @@ void MainWindow::onRefresh()
     if (tab == 0) {
         m_procTable->setRowCount(0);
         m_processRows.clear();
-        m_udp->sendCommand(NETDRV_CMD_ENUM_PROCESS);
+        m_tcp->sendCommand(NETDRV_CMD_ENUM_PROCESS);
         setStatus("[process] requesting...");
     } else if (tab == 1) {
         m_drvTable->setRowCount(0);
-        m_udp->sendCommand(NETDRV_CMD_ENUM_DRIVER);
+        m_tcp->sendCommand(NETDRV_CMD_ENUM_DRIVER);
         setStatus("[driver] requesting...");
     } else if (tab == 2) {
         auto sel = m_fileTree->selectedItems();
@@ -494,7 +536,7 @@ void MainWindow::onRefresh()
         m_shotImage.clear();
         m_shotChunkSeen.clear();
         m_shotLive = true;
-        m_udp->sendCommand(NETDRV_CMD_SCREENSHOT);
+        m_tcp->sendCommand(NETDRV_CMD_SCREENSHOT);
         setStatus("[screenshot] requesting...");
     }
 }
@@ -502,7 +544,7 @@ void MainWindow::onRefresh()
 void MainWindow::onShotTimer()
 {
     if (m_shotLive && currentTab() == 3 && !m_shotReceiving) {
-        m_udp->sendCommand(NETDRV_CMD_SCREENSHOT);
+        m_tcp->sendCommand(NETDRV_CMD_SCREENSHOT);
     }
 }
 
@@ -511,6 +553,44 @@ void MainWindow::onShotTimer()
 void MainWindow::beginShotFrame(const QByteArray& rest)
 {
     auto parts = rest.split('|');
+
+    /* V2: fid|w|h|rawSizeHex|compSizeHex|chunkSz|chunkCnt|isKey */
+    if (parts.size() >= 8) {
+        uint fid    = parts[0].toUInt();
+        uint w      = parts[1].toUInt();
+        uint h      = parts[2].toUInt();
+        size_t raw  = parts[3].toULongLong(nullptr, 16);
+        size_t comp = parts[4].toULongLong(nullptr, 16);
+        uint chunks = parts[6].toUInt();
+        bool isKey  = parts[7].toUInt() != 0;
+
+        if (w == 0 || h == 0 || raw == 0 || comp == 0 || chunks == 0 ||
+            raw != (size_t)w * h * 4 || raw > 64ULL * 1024 * 1024)
+            return;
+
+        m_shotReceiving  = true;
+        m_shotV2         = true;
+        m_shotIsKey      = isKey;
+        m_shotFrameId    = fid;
+        m_shotWidth      = w;
+        m_shotHeight     = h;
+        m_shotExpected   = raw;
+        m_shotCompSize   = comp;
+        m_shotCompRecv   = 0;
+        m_shotReceived   = 0;
+        m_shotChunkCount = chunks;
+        m_shotCompBuf.fill(0, (int)comp);
+        m_shotChunkSeen.fill(false, chunks);
+        /* Allocate image buffer (keep prev for diff) */
+        m_shotImage.resize((int)raw);
+        shotLog("BEGIN fid=%u %ux%u raw=%zu comp=%zu chunks=%u key=%d",
+                fid, w, h, raw, comp, chunks, isKey ? 1 : 0);
+        setStatus(QString("[shot2] frame %1 %2x%3 comp=%4 key=%5")
+                  .arg(fid).arg(w).arg(h).arg(comp).arg(isKey));
+        return;
+    }
+
+    /* V1 fallback: fid|w|h|totalHex|chunkSz|chunkCnt */
     if (parts.size() < 6) return;
     uint fid    = parts[0].toUInt();
     uint w      = parts[1].toUInt();
@@ -523,6 +603,7 @@ void MainWindow::beginShotFrame(const QByteArray& rest)
         return;
 
     m_shotReceiving  = true;
+    m_shotV2         = false;
     m_shotFrameId    = fid;
     m_shotWidth      = w;
     m_shotHeight     = h;
@@ -569,19 +650,90 @@ void MainWindow::endShotFrame(const QByteArray& rest)
     if (fid != m_shotFrameId) return;
     m_shotReceiving = false;
 
-    if (m_shotReceived != m_shotExpected) {
-        setStatus(QString("[shot] frame %1 incomplete %2/%3")
-                  .arg(fid).arg(m_shotReceived).arg(m_shotExpected));
-        if (m_shotLive) m_shotTimer->start(33);
-        return;
+    if (m_shotV2) {
+        /* V2: decompress RLE, apply XOR diff */
+        shotLog("END fid=%u compRecv=%zu/%zu isKey=%d prevSz=%d expected=%zu",
+                fid, m_shotCompRecv, m_shotCompSize, m_shotIsKey,
+                m_shotPrevImage.size(), m_shotExpected);
+        if (m_shotCompRecv != m_shotCompSize) {
+            setStatus(QString("[shot2] frame %1 incomplete comp %2/%3")
+                      .arg(fid).arg(m_shotCompRecv).arg(m_shotCompSize));
+            m_shotPrevImage.clear();                   /* desync: drop prev to avoid garbage propagation */
+            m_tcp->sendCommand(NETDRV_CMD_SHOT_KEYFRAME); /* ask driver for keyframe */
+            if (m_shotLive) m_shotTimer->start(33);
+            return;
+        }
+
+        quint32 dwordCount = (quint32)(m_shotExpected / 4);
+        QByteArray decoded;
+
+        /* When driver's RLE failed it sends raw pixels with comp==raw and
+           isKey=1.  Detect this and skip RLE decode — the raw pixel bytes
+           would be mis-interpreted as RLE runs (the clamping logic inside
+           rleDecompress almost always "succeeds" on random data, producing
+           garbage of the correct size). */
+        if (m_shotIsKey && m_shotCompSize == m_shotExpected) {
+            decoded = m_shotCompBuf;
+        } else {
+            decoded = rleDecompress(m_shotCompBuf, dwordCount);
+        }
+
+        if (decoded.size() != (int)m_shotExpected) {
+            /* RLE decode size mismatch — treat as raw keyframe data */
+            if (m_shotCompBuf.size() == (int)m_shotExpected) {
+                decoded = m_shotCompBuf;
+                m_shotIsKey = true;
+            } else {
+                setStatus(QString("[shot2] frame %1 decode error %2 != %3")
+                          .arg(fid).arg(decoded.size()).arg(m_shotExpected));
+                m_shotPrevImage.clear();
+                m_tcp->sendCommand(NETDRV_CMD_SHOT_KEYFRAME);
+                if (m_shotLive) m_shotTimer->start(33);
+                return;
+            }
+        }
+
+        if (m_shotIsKey) {
+            m_shotImage = decoded;
+        } else {
+            /* XOR with previous frame */
+            if (m_shotPrevImage.size() == (int)m_shotExpected) {
+                const quint32* diff = (const quint32*)decoded.constData();
+                const quint32* prev = (const quint32*)m_shotPrevImage.constData();
+                quint32* out = (quint32*)m_shotImage.data();
+                for (quint32 i = 0; i < dwordCount; i++)
+                    out[i] = prev[i] ^ diff[i];
+            } else {
+                /* No valid prev — cannot apply diff, wait for keyframe */
+                setStatus(QString("[shot2] frame %1 waiting for keyframe (no prev)")
+                          .arg(fid));
+                m_tcp->sendCommand(NETDRV_CMD_SHOT_KEYFRAME);
+                if (m_shotLive) m_shotTimer->start(33);
+                return;
+            }
+        }
+        m_shotPrevImage = m_shotImage;
+
+        renderShot();
+        setStatus(QString("[shot2] frame %1 %2x%3 comp=%4/%5 key=%6")
+                  .arg(fid).arg(m_shotWidth).arg(m_shotHeight)
+                  .arg(m_shotCompSize).arg(m_shotExpected).arg(m_shotIsKey));
+    } else {
+        /* V1: hex-based, data already in m_shotImage */
+        if (m_shotReceived != m_shotExpected) {
+            setStatus(QString("[shot] frame %1 incomplete %2/%3")
+                      .arg(fid).arg(m_shotReceived).arg(m_shotExpected));
+            if (m_shotLive) m_shotTimer->start(33);
+            return;
+        }
+
+        renderShot();
+        setStatus(QString("[shot] frame %1 %2x%3 rendered (%4 bytes)")
+                  .arg(fid).arg(m_shotWidth).arg(m_shotHeight).arg(m_shotExpected));
     }
 
-    renderShot();
-    setStatus(QString("[shot] frame %1 %2x%3 rendered (%4 bytes)")
-              .arg(fid).arg(m_shotWidth).arg(m_shotHeight).arg(m_shotExpected));
-
     if (m_shotLive && currentTab() == 3)
-        m_shotTimer->start(33);
+        m_shotTimer->start(50);  /* ~20 fps cap; gives other TCP ops breathing room */
 }
 
 void MainWindow::renderShot()
@@ -596,6 +748,56 @@ void MainWindow::renderShot()
     QPixmap pm = QPixmap::fromImage(img).scaled(
         m_shotLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
     m_shotLabel->setPixmap(pm);
+}
+
+// ---- V2 binary shot chunk ----
+
+void MainWindow::appendShotChunkV2(const QByteArray& binPayload)
+{
+    if (!m_shotReceiving || !m_shotV2) return;
+    // binPayload: "Z|" + fid(4B LE) + idx(4B LE) + off(4B LE) + len(4B LE) + data
+    if (binPayload.size() < 18) return;
+    const uchar* p = (const uchar*)binPayload.constData() + 2;
+    quint32 fid = *(const quint32*)p;  p += 4;
+    quint32 idx = *(const quint32*)p;  p += 4;
+    quint32 off = *(const quint32*)p;  p += 4;
+    quint32 len = *(const quint32*)p;  p += 4;
+
+    if (fid != m_shotFrameId || idx >= m_shotChunkCount) return;
+    if ((qint64)(off + len) > m_shotCompBuf.size()) return;
+    if ((int)(18 + len) > binPayload.size()) return;
+    if (m_shotChunkSeen[idx]) return;
+
+    memcpy(m_shotCompBuf.data() + off, p, len);
+    m_shotChunkSeen[idx] = true;
+    m_shotCompRecv += len;
+    if (idx == 0 || m_shotCompRecv == m_shotCompSize)
+        shotLog("  CHUNK fid=%u idx=%u/%u off=%u len=%u compRecv=%zu/%zu",
+                fid, idx, m_shotChunkCount, off, len, m_shotCompRecv, m_shotCompSize);
+}
+
+QByteArray MainWindow::rleDecompress(const QByteArray& comp, quint32 dwordCount)
+{
+    QByteArray out(dwordCount * 4, Qt::Uninitialized);
+    quint32* dst = (quint32*)out.data();
+    const uchar* src = (const uchar*)comp.constData();
+    int srcLen = comp.size();
+    int pos = 0;
+    quint32 written = 0;
+
+    while (pos + 6 <= srcLen && written < dwordCount) {
+        quint16 count = *(const quint16*)(src + pos);
+        quint32 value = *(const quint32*)(src + pos + 2);
+        pos += 6;
+        if (written + count > dwordCount)
+            count = (quint16)(dwordCount - written);
+        for (quint16 i = 0; i < count; i++)
+            dst[written++] = value;
+    }
+
+    if (written < dwordCount)
+        out.resize(written * 4);
+    return out;
 }
 
 // ---- file browser ----
@@ -621,7 +823,7 @@ void MainWindow::initFileTree()
 void MainWindow::requestFileEnum(const QString& path)
 {
     QByteArray cmd = QByteArray(NETDRV_CMD_ENUM_FILE) + path.toUtf8() + "\n";
-    m_udp->sendCommand(cmd);
+    m_tcp->sendCommand(cmd);
     setStatus(QString("[file] requesting %1").arg(path));
 }
 
@@ -762,7 +964,7 @@ void MainWindow::onDownload()
     m_progressLabel->show();
 
     QByteArray cmd = QByteArray(NETDRV_CMD_GET_FILE) + remotePath.toUtf8() + "\n";
-    m_udp->sendCommand(cmd);
+    m_tcp->sendCommand(cmd);
     setStatus(QString("[get] requested %1").arg(remotePath));
 }
 
@@ -809,7 +1011,7 @@ void MainWindow::endDownload(quint64 reported)
         m_dlReceived = 0;
         m_dlTotal = 0;
         QByteArray cmd = QByteArray(NETDRV_CMD_GET_FILE) + m_dlRemotePath.toUtf8() + "\n";
-        m_udp->sendCommand(cmd);
+        m_tcp->sendCommand(cmd);
         return;
     }
 
@@ -828,6 +1030,7 @@ void MainWindow::endDownload(quint64 reported)
 void MainWindow::onUpload()
 {
     if (currentTab() != 2) { setStatus("[file] switch to File tab first"); return; }
+    if (m_ulActive) { setStatus("[put] upload already running"); return; }
     auto selTree = m_fileTree->selectedItems();
     if (selTree.isEmpty()) { setStatus("[put] select target directory"); return; }
     QString remoteDir = treePath(selTree.first());
@@ -835,40 +1038,73 @@ void MainWindow::onUpload()
     QString localPath = QFileDialog::getOpenFileName(this, "Select File to Upload");
     if (localPath.isEmpty()) return;
 
-    QFile f(localPath);
-    if (!f.open(QIODevice::ReadOnly)) { setStatus("[put] cannot open source"); return; }
-    quint64 total = f.size();
-    if (total > 64ULL * 1024 * 1024) { setStatus("[put] file too large (>64MB)"); return; }
+    resetUpload();
+    m_ulFile = new QFile(localPath, this);
+    if (!m_ulFile->open(QIODevice::ReadOnly)) {
+        setStatus("[put] cannot open source");
+        resetUpload();
+        return;
+    }
 
-    QString fileName = QFileInfo(localPath).fileName();
-    QString remotePath = remoteDir.endsWith('\\')
-        ? remoteDir + fileName : remoteDir + '\\' + fileName;
+    quint64 total = m_ulFile->size();
+    if (total > 64ULL * 1024 * 1024) {
+        setStatus("[put] file too large (>64MB)");
+        resetUpload();
+        return;
+    }
 
-    const uint chunkSize = 512;
-    uint chunkCount = (uint)((total + chunkSize - 1) / chunkSize);
-    if (chunkCount == 0) chunkCount = 1;
+    m_ulFileName = QFileInfo(localPath).fileName();
+    m_ulRemotePath = remoteDir.endsWith('\\')
+        ? remoteDir + m_ulFileName : remoteDir + '\\' + m_ulFileName;
+    m_ulTotal = total;
+    m_ulSent = 0;
+    m_ulChunkSize = 8192;
+    m_ulChunkCount = (uint)((total + m_ulChunkSize - 1) / m_ulChunkSize);
+    if (m_ulChunkCount == 0) m_ulChunkCount = 1;
+    m_ulIndex = 0;
+    m_ulActive = true;
 
-    // C|put|path|sizeHex|chunkSize|chunkCount
-    QByteArray putCmd = QByteArray(NETDRV_CMD_PUT_BEGIN) + remotePath.toUtf8()
+    QByteArray putCmd = QByteArray(NETDRV_CMD_PUT_BEGIN) + m_ulRemotePath.toUtf8()
         + "|" + QByteArray::number(total, 16).toUpper()
-        + "|" + QByteArray::number(chunkSize)
-        + "|" + QByteArray::number(chunkCount) + "\n";
-    m_udp->enqueue(putCmd);
+        + "|" + QByteArray::number(m_ulChunkSize)
+        + "|" + QByteArray::number(m_ulChunkCount) + "\n";
+    if (!m_tcp->sendCommand(putCmd)) {
+        setStatus("[put] cannot send begin command");
+        resetUpload();
+        return;
+    }
 
-    // Show upload progress
-    m_progressBar->setRange(0, (int)chunkCount);
+    m_progressBar->setRange(0, (int)m_ulChunkCount);
     m_progressBar->setValue(0);
     m_progressBar->setTextVisible(false);
     m_progressBar->show();
-    m_progressLabel->setText(QString("Upload: %1  0/%2").arg(fileName).arg(total));
+    m_progressLabel->setText(QString("Upload: %1  0/%2").arg(m_ulFileName).arg(total));
     m_progressLabel->show();
 
-    static const char kHex[] = "0123456789ABCDEF";
-    quint64 sent = 0;
-    uint idx = 0;
+    m_uploadTimer->start();
+    setStatus(QString("[put] started %1 -> %2").arg(localPath).arg(m_ulRemotePath));
+}
 
-    while (sent < total) {
-        QByteArray chunk = f.read(chunkSize);
+void MainWindow::pumpUpload()
+{
+    if (!m_ulActive || !m_ulFile)
+        return;
+
+    if (!m_tcp->isDriverConnected()) {
+        setStatus("[put] driver disconnected");
+        resetUpload();
+        return;
+    }
+
+    static const char kHex[] = "0123456789ABCDEF";
+    const int maxChunksPerTick = 8;
+    int chunksThisTick = 0;
+
+    while (m_ulSent < m_ulTotal && chunksThisTick < maxChunksPerTick) {
+        if (m_tcp->fileBytesToWrite() > NETDRV_TCP_FILE_WRITE_WATERMARK)
+            break;
+
+        QByteArray chunk = m_ulFile->read(m_ulChunkSize);
         if (chunk.isEmpty()) break;
 
         QByteArray hex;
@@ -878,27 +1114,53 @@ void MainWindow::onUpload()
             hex.append(kHex[b & 0xF]);
         }
 
-        QByteArray pkt = "P|" + QByteArray::number(idx)
-            + "|" + QByteArray::number(sent, 16).toUpper()
+        QByteArray pkt = "P|" + QByteArray::number(m_ulIndex)
+            + "|" + QByteArray::number(m_ulSent, 16).toUpper()
             + "|" + QByteArray::number(chunk.size(), 16).toUpper()
             + "|" + hex + "\n";
-        m_udp->enqueue(pkt);
+        if (!m_tcp->sendCommand(pkt)) {
+            setStatus("[put] send failed");
+            resetUpload();
+            return;
+        }
 
-        sent += chunk.size();
-        ++idx;
-        if ((idx & 0xF) == 0) {
-            m_progressBar->setValue(idx);
+        m_ulSent += chunk.size();
+        ++m_ulIndex;
+        ++chunksThisTick;
+
+        if ((m_ulIndex & 0xF) == 0 || m_ulSent == m_ulTotal) {
+            m_progressBar->setValue((int)m_ulIndex);
             m_progressLabel->setText(QString("Upload: %1%%  %2/%3")
-                .arg((int)(sent * 100 / total)).arg(sent).arg(total));
-            setStatus(QString("[put] %1 / %2").arg(sent).arg(total));
-            QApplication::processEvents();
+                .arg((int)(m_ulSent * 100 / m_ulTotal)).arg(m_ulSent).arg(m_ulTotal));
+            setStatus(QString("[put] %1 / %2").arg(m_ulSent).arg(m_ulTotal));
         }
     }
-    f.close();
 
-    QByteArray endCmd = QByteArray(NETDRV_CMD_PUT_END) + remotePath.toUtf8()
-        + "|" + QByteArray::number(total, 16).toUpper() + "\n";
-    m_udp->enqueue(endCmd);
+    if (m_ulSent >= m_ulTotal) {
+        finishUpload();
+        return;
+    }
+
+    if (!m_uploadTimer->isActive())
+        m_uploadTimer->start();
+}
+
+void MainWindow::finishUpload()
+{
+    if (!m_ulActive)
+        return;
+
+    if (m_ulFile) {
+        m_ulFile->close();
+    }
+
+    QByteArray endCmd = QByteArray(NETDRV_CMD_PUT_END) + m_ulRemotePath.toUtf8()
+        + "|" + QByteArray::number(m_ulTotal, 16).toUpper() + "\n";
+    if (!m_tcp->sendCommand(endCmd)) {
+        setStatus("[put] cannot send end command");
+        resetUpload();
+        return;
+    }
     m_progressBar->setValue(m_progressBar->maximum());
     m_progressLabel->setText("Upload: 100% Complete");
     QTimer::singleShot(1000, this, [this]{
@@ -906,5 +1168,25 @@ void MainWindow::onUpload()
         m_progressLabel->hide();
     });
     setStatus(QString("[put] sent %1 bytes (%2 chunks) -> %3")
-              .arg(sent).arg(idx).arg(remotePath));
+              .arg(m_ulSent).arg(m_ulIndex).arg(m_ulRemotePath));
+    resetUpload();
+}
+
+void MainWindow::resetUpload()
+{
+    if (m_uploadTimer)
+        m_uploadTimer->stop();
+    if (m_ulFile) {
+        m_ulFile->close();
+        delete m_ulFile;
+        m_ulFile = nullptr;
+    }
+    m_ulRemotePath.clear();
+    m_ulFileName.clear();
+    m_ulTotal = 0;
+    m_ulSent = 0;
+    m_ulChunkSize = 8192;
+    m_ulChunkCount = 0;
+    m_ulIndex = 0;
+    m_ulActive = false;
 }

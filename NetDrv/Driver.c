@@ -16,11 +16,15 @@ Abstract:
 #include "Ioctl.h"
 #include "NetControl.h"
 #include "ScreenShot.h"
+#include "TcpLink.h"
+#include "NetLinkApi.h"
+
+#include "../Shared/NdarkLog.h"
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD     NetDrvUnload;
 
-#define LOG(fmt, ...) /* disabled */
+#define LOG(fmt, ...) NDARK_LOG_INFO(fmt, ##__VA_ARGS__)
 
 // ---------------------------------------------------------------------------
 
@@ -29,8 +33,9 @@ NetDrvUnload(_In_ PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
     LOG("Unload");
-    NetDrvScreenCleanup();
     NetDrvStopControlListener();
+    TcpLinkStop();
+    NetDrvScreenCleanup();
     WSKCleanup();
 }
 
@@ -52,6 +57,14 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
         return status;
     }
 
+    /* C++ runtime self-test: ensures NetLink.cpp/KernelCxx.cpp are linked
+       into the final .sys. Skeleton phase only exercises placement new and
+       vtable dispatch; future revisions will replace this with the real
+       NetDrvCreateUdpLink / NetDrvCreateTcpChannel factory calls. */
+#ifndef NDARK_NO_CPP
+    (void)NetLinkRuntimeSelfTest();
+#endif
+
     status = NetDrvStartControlListener();
     if (!NT_SUCCESS(status)) {
         LOG("NetDrvStartControlListener failed 0x%08X", status);
@@ -59,10 +72,18 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
         return status;
     }
 
-    LOG("Ready: UDP control %s:%u -> app %s:%u",
+    status = TcpLinkStart();
+    if (!NT_SUCCESS(status)) {
+        LOG("TcpLinkStart failed 0x%08X", status);
+        /* Non-fatal: UDP still works */
+    }
+
+    LOG("Ready: UDP %s:%u  TCP control/screen/file -> %s:%u/%u/%u",
         NETDRV_DRIVER_IP_A,
         NETDRV_UDP_PORT,
         NETDRV_APP_IP_A,
-        NETDRV_UDP_PORT);
+        NETDRV_TCP_CONTROL_PORT,
+        NETDRV_TCP_SCREEN_PORT,
+        NETDRV_TCP_FILE_PORT);
     return STATUS_SUCCESS;
 }

